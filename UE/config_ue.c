@@ -2803,3 +2803,319 @@ void nr_rrc_mac_config_req_cg(module_id_t module_id,
   ret = pthread_mutex_unlock(&mac->if_mutex);
   AssertFatal(!ret, "mutex failed %d\n", ret);
 }
+
+
+/**
+ * @brief Configure Grant-Free transmission parameters
+ * 
+ * This function validates and stores a Grant-Free configuration.
+ * It performs comprehensive validation of all parameters to ensure
+ * they are within valid ranges and consistent with each other.
+ * 
+ * @param mac       Pointer to UE MAC instance
+ * @param gf_params Pointer to GF configuration to apply
+ * @return          0 on success, -1 on failure
+ */
+int nr_ue_configure_grant_free(NR_UE_MAC_INST_t *mac, nr_gf_config_t *gf_params)
+{
+  /* ========== Validate Basic Parameters ========== */
+  
+  if (!mac || !gf_params) {
+    LOG_E(NR_MAC, "Invalid parameters to nr_ue_configure_grant_free\n");
+    return -1;
+  }
+  
+  // Check if we have room for another configuration
+  if (mac->num_gf_configs >= NR_MAX_GF_CONFIGS) {
+    LOG_E(NR_MAC, "[UE %d] Maximum GF configurations (%d) reached\n",
+          mac->ue_id, NR_MAX_GF_CONFIGS);
+    return -1;
+  }
+  
+  /* ========== Validate Time Domain Parameters ========== */
+  
+  // Periodicity must be positive
+  if (gf_params->periodicity == 0) {
+    LOG_E(NR_MAC, "[UE %d] GF periodicity must be > 0\n", mac->ue_id);
+    return -1;
+  }
+  
+  // Offset must be less than periodicity
+  if (gf_params->offset >= gf_params->periodicity) {
+    LOG_E(NR_MAC, "[UE %d] GF offset (%d) must be < periodicity (%d)\n",
+          mac->ue_id, gf_params->offset, gf_params->periodicity);
+    return -1;
+  }
+  
+  // Start symbol must be valid (0-13)
+  if (gf_params->start_symbol > 13) {
+    LOG_E(NR_MAC, "[UE %d] GF start_symbol (%d) must be <= 13\n",
+          mac->ue_id, gf_params->start_symbol);
+    return -1;
+  }
+  
+  // Number of symbols must be valid (1-14) and fit in slot
+  if (gf_params->nr_of_symbols == 0 || gf_params->nr_of_symbols > 14) {
+    LOG_E(NR_MAC, "[UE %d] GF nr_of_symbols (%d) must be 1-14\n",
+          mac->ue_id, gf_params->nr_of_symbols);
+    return -1;
+  }
+  
+  if (gf_params->start_symbol + gf_params->nr_of_symbols > 14) {
+    LOG_E(NR_MAC, "[UE %d] GF symbol allocation (%d+%d) exceeds slot boundary\n",
+          mac->ue_id, gf_params->start_symbol, gf_params->nr_of_symbols);
+    return -1;
+  }
+  
+  /* ========== Validate Frequency Domain Parameters ========== */
+  
+  // RB size must be positive
+  if (gf_params->rb_size == 0) {
+    LOG_E(NR_MAC, "[UE %d] GF rb_size must be > 0\n", mac->ue_id);
+    return -1;
+  }
+  
+  // If BWP is available, validate against it
+  if (mac->current_UL_BWP) {
+    uint16_t bwp_size = mac->current_UL_BWP->BWPSize;
+    if (gf_params->rb_start + gf_params->rb_size > bwp_size) {
+      LOG_E(NR_MAC, "[UE %d] GF RB allocation (%d+%d) exceeds BWP size (%d)\n",
+            mac->ue_id, gf_params->rb_start, gf_params->rb_size, bwp_size);
+      return -1;
+    }
+  }
+  
+  /* ========== Validate MCS ========== */
+  
+  // MCS must be valid (0-28 for standard tables)
+  if (gf_params->mcs > 28) {
+    LOG_E(NR_MAC, "[UE %d] GF MCS (%d) must be <= 28\n",
+          mac->ue_id, gf_params->mcs);
+    return -1;
+  }
+  
+  // MCS table must be valid (0, 1, or 2)
+  if (gf_params->mcs_table > 2) {
+    LOG_W(NR_MAC, "[UE %d] GF MCS table (%d) invalid, using 0\n",
+          mac->ue_id, gf_params->mcs_table);
+    gf_params->mcs_table = 0;
+  }
+  
+  /* ========== Validate HARQ Parameters ========== */
+  
+  // HARQ process ID must be valid
+  if (gf_params->harq_process_id >= NR_MAX_HARQ_PROCESSES) {
+    LOG_E(NR_MAC, "[UE %d] GF HARQ process ID (%d) must be < %d\n",
+          mac->ue_id, gf_params->harq_process_id, NR_MAX_HARQ_PROCESSES);
+    return -1;
+  }
+  
+  /* ========== Set Default Values for Optional Parameters ========== */
+  
+  // Set default RV sequence if not provided
+  if (gf_params->rv_sequence[0] == 0 && 
+      gf_params->rv_sequence[1] == 0 &&
+      gf_params->rv_sequence[2] == 0 &&
+      gf_params->rv_sequence[3] == 0) {
+    // Standard RV sequence per 3GPP
+    gf_params->rv_sequence[0] = 0;  // Initial transmission
+    gf_params->rv_sequence[1] = 2;  // 1st retransmission
+    gf_params->rv_sequence[2] = 3;  // 2nd retransmission
+    gf_params->rv_sequence[3] = 1;  // 3rd retransmission
+  }
+  
+  // Set default DMRS configuration if not provided
+  if (gf_params->dmrs_ports == 0) {
+    gf_params->dmrs_ports = 1;  // Port 0
+  }
+  
+  if (gf_params->num_dmrs_cdm_grps_no_data == 0) {
+    gf_params->num_dmrs_cdm_grps_no_data = 2;  // Default for single layer
+  }
+  
+  /* ========== Store Configuration ========== */
+  
+  nr_gf_config_t *gf = &mac->gf_config[mac->num_gf_configs];
+  
+  // Copy all parameters
+  *gf = *gf_params;
+  
+  // Set configuration index
+  gf->config_index = mac->num_gf_configs;
+  
+  // Initialize state
+  gf->enabled = true;
+  gf->active = true;
+  gf->ndi_toggle = 0;
+  
+  // Clear statistics
+  gf->tx_count = 0;
+  gf->tx_with_data = 0;
+  gf->tx_empty = 0;
+  gf->harq_nack_count = 0;
+  gf->harq_dtx_count = 0;
+  
+  // Increment config counter
+  mac->num_gf_configs++;
+  
+  // Enable GF globally
+  mac->gf_enabled = true;
+  
+  /* ========== Log Configuration ========== */
+  
+  LOG_I(NR_MAC, "[UE %d] Grant-Free configuration %d added:\n"
+        "        Periodicity: %d slots, Offset: %d\n"
+        "        Time: symbol %d to %d (%d symbols)\n"
+        "        Frequency: PRB %d to %d (%d PRBs)\n"
+        "        MCS: %d (table %d)\n"
+        "        HARQ: process %d, RV sequence {%d,%d,%d,%d}\n"
+        "        DMRS: type %d, ports 0x%02x\n",
+        mac->ue_id, gf->config_index,
+        gf->periodicity, gf->offset,
+        gf->start_symbol, gf->start_symbol + gf->nr_of_symbols - 1, gf->nr_of_symbols,
+        gf->rb_start, gf->rb_start + gf->rb_size - 1, gf->rb_size,
+        gf->mcs, gf->mcs_table,
+        gf->harq_process_id,
+        gf->rv_sequence[0], gf->rv_sequence[1], gf->rv_sequence[2], gf->rv_sequence[3],
+        gf->dmrs_config_type, gf->dmrs_ports);
+  
+  return 0;
+}
+
+/**
+ * @brief Initialize default Grant-Free configuration for testing
+ * 
+ * Creates a hardcoded GF configuration suitable for Phase 1 testing.
+ * Uses conservative parameters for maximum reliability.
+ * 
+ * Configuration:
+ *   - Periodicity: 4 slots (~0.5ms at 30kHz SCS)
+ *   - 10 PRBs starting at PRB 0
+ *   - 12 symbols starting at symbol 2
+ *   - MCS 9 (QPSK, reliable)
+ *   - HARQ process 0
+ * 
+ * @param mac Pointer to UE MAC instance
+ */
+void nr_ue_init_default_grant_free(NR_UE_MAC_INST_t *mac)
+{
+  if (!mac) {
+    LOG_E(NR_MAC, "Invalid MAC pointer in nr_ue_init_default_grant_free\n");
+    return;
+  }
+  
+  // Check if UE is in appropriate state
+  if (mac->state != UE_CONNECTED) {
+    LOG_W(NR_MAC, "[UE %d] Cannot init GF: UE not connected (state=%d)\n",
+          mac->ue_id, mac->state);
+    return;
+  }
+  
+  // Check if BWP is available
+  if (!mac->current_UL_BWP) {
+    LOG_W(NR_MAC, "[UE %d] Cannot init GF: No active UL BWP\n", mac->ue_id);
+    return;
+  }
+  
+  LOG_I(NR_MAC, "[UE %d] Initializing default Grant-Free configuration\n", mac->ue_id);
+  
+  /* ========== Define Default Parameters ========== */
+  
+  nr_gf_config_t gf_params = {0};  // Zero-initialize
+  
+  // Time domain configuration
+  gf_params.periodicity = 4;       // Every 4 slots
+  gf_params.offset = 0;            // Start at slot 0
+  gf_params.start_symbol = 2;      // Start at symbol 2 (after control)
+  gf_params.nr_of_symbols = 12;    // 12 symbols (most of the slot)
+  gf_params.mapping_type = 0;      // Type A
+  
+  // Frequency domain configuration
+  // Use conservative allocation that should fit in any BWP
+  uint16_t bwp_size = mac->current_UL_BWP->BWPSize;
+  gf_params.rb_start = 0;
+  gf_params.rb_size = (bwp_size >= 10) ? 10 : bwp_size;  // 10 PRBs or BWP size
+  gf_params.frequency_hopping = 0;  // Disabled
+  
+  // MCS configuration - use conservative MCS for reliability
+  gf_params.mcs = 9;               // QPSK with medium code rate
+  gf_params.mcs_table = 0;         // Table 1
+  
+  // HARQ configuration
+  gf_params.harq_process_id = 0;   // Use HARQ process 0
+  gf_params.rv_sequence[0] = 0;    // Standard RV sequence
+  gf_params.rv_sequence[1] = 2;
+  gf_params.rv_sequence[2] = 3;
+  gf_params.rv_sequence[3] = 1;
+  gf_params.repK = 1;              // No repetition
+  
+  // DMRS configuration
+  gf_params.dmrs_config_type = 0;  // Type 1
+  gf_params.dmrs_ports = 1;        // Port 0
+  gf_params.dmrs_scrambling_id = 0; // Use PCI
+  gf_params.num_dmrs_cdm_grps_no_data = 2;
+  gf_params.dmrs_add_pos = 2;      // Additional DMRS position 2
+  
+  // Transform precoding
+  gf_params.transform_precoding = false;  // CP-OFDM
+  
+  // RNTI - use C-RNTI
+  gf_params.rnti = mac->crnti;
+  
+  /* ========== Apply Configuration ========== */
+  
+  int ret = nr_ue_configure_grant_free(mac, &gf_params);
+  if (ret != 0) {
+    LOG_E(NR_MAC, "[UE %d] Failed to apply default GF configuration\n", mac->ue_id);
+  } else {
+    LOG_I(NR_MAC, "[UE %d] Default GF configuration applied successfully\n", mac->ue_id);
+  }
+}
+
+/**
+ * @brief Release/disable a Grant-Free configuration
+ * 
+ * Deactivates and clears the specified GF configuration.
+ * Does not compact the array, just marks the slot as unused.
+ * 
+ * @param mac          Pointer to UE MAC instance
+ * @param config_index Index of GF configuration to release
+ * @return             0 on success, -1 if config_index is invalid
+ */
+int nr_ue_release_grant_free(NR_UE_MAC_INST_t *mac, uint8_t config_index)
+{
+  if (!mac || config_index >= NR_MAX_GF_CONFIGS) {
+    LOG_E(NR_MAC, "Invalid parameters to nr_ue_release_grant_free\n");
+    return -1;
+  }
+  
+  nr_gf_config_t *gf = &mac->gf_config[config_index];
+  
+  if (!gf->enabled) {
+    LOG_W(NR_MAC, "[UE %d] GF config %d already released\n",
+          mac->ue_id, config_index);
+    return 0;
+  }
+  
+  LOG_I(NR_MAC, "[UE %d] Releasing GF configuration %d (stats: tx=%d, nack=%d, dtx=%d)\n",
+        mac->ue_id, config_index, 
+        gf->tx_count, gf->harq_nack_count, gf->harq_dtx_count);
+  
+  // Clear the configuration
+  memset(gf, 0, sizeof(nr_gf_config_t));
+  
+  // Update count and global enable flag
+  // Note: We don't decrement num_gf_configs to maintain stable indices
+  // Check if any configs are still active
+  bool any_active = false;
+  for (int i = 0; i < NR_MAX_GF_CONFIGS; i++) {
+    if (mac->gf_config[i].enabled) {
+      any_active = true;
+      break;
+    }
+  }
+  mac->gf_enabled = any_active;
+  
+  return 0;
+}
+

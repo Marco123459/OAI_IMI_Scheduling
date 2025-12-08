@@ -361,4 +361,45 @@ void nr_ue_sidelink_scheduler(nr_sidelink_indication_t *sl_ind, NR_UE_MAC_INST_t
 
 NR_SearchSpace_t *get_common_search_space(const NR_UE_MAC_INST_t *mac, const NR_SearchSpaceId_t ss_id);
 
+
+/* ============================================================================
+ * GRANT-FREE FUNCTION PROTOTYPES
+ * ============================================================================
+ */
+int nr_ue_configure_grant_free(NR_UE_MAC_INST_t *mac, nr_gf_config_t *gf_params);
+
+void nr_ue_init_default_grant_free(NR_UE_MAC_INST_t *mac);
+
+int nr_ue_release_grant_free(NR_UE_MAC_INST_t *mac, uint8_t config_index);
+
+nr_gf_config_t* nr_ue_check_grant_free_occasion(NR_UE_MAC_INST_t *mac, 
+                                                 frame_t frame, 
+                                                 int slot);
+
+void nr_ue_schedule_grant_free(NR_UE_MAC_INST_t *mac, frame_t frame, int slot);
+
+int nr_config_pusch_pdu_grant_free(NR_UE_MAC_INST_t *mac,
+                                    nr_gf_config_t *gf,
+                                    nfapi_nr_ue_pusch_pdu_t *pusch_pdu,
+                                    frame_t frame,
+                                    int slot);
+
+void nr_ue_gf_harq_handler(NR_UE_MAC_INST_t *mac, 
+                            nr_gf_config_t *gf,
+                            int harq_feedback);
+
+typedef struct {
+  uint32_t tx_total;
+  uint32_t tx_with_data;
+  uint32_t tx_empty;
+  uint32_t harq_ack;
+  uint32_t harq_nack;
+  uint32_t harq_dtx;
+} nr_gf_stats_t;
+
+int nr_ue_get_grant_free_stats(NR_UE_MAC_INST_t *mac, 
+                                uint8_t config_index,
+                                nr_gf_stats_t *stats);
+
+
 #endif

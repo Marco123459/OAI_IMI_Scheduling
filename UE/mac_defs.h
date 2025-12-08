@@ -160,6 +160,155 @@
 #define MAX_TDM (7) // Maximum nb of PRACH occasions TDMed in a slot
 #define MAX_FDM (8) // Maximum nb of PRACH occasions FDMed in a slot
 
+
+// Maximum number of GF configurations per UE
+// Allows flexibility for different traffic types (e.g., periodic sensor data, VoIP)
+#define NR_MAX_GF_CONFIGS 4
+
+// Grant-Free HARQ process range (can use subset of available processes)
+#define NR_GF_HARQ_PROCESS_START 0
+#define NR_GF_HARQ_PROCESS_END   3  // Use HARQ processes 0-3 for GF
+
+typedef struct nr_gf_config {
+  
+  /* ========== Basic Enable/Status Flags ========== */
+  
+  bool enabled;           // GF configuration is valid and can be used
+  bool active;            // GF is currently active (can be temporarily deactivated)
+  
+  /* ========== Time Domain Configuration ========== 
+   * 
+   * GF occasions occur when: (absolute_slot - offset) % periodicity == 0
+   * 
+   * Example with periodicity=4, offset=1:
+   *   Slot:      0  1  2  3  4  5  6  7  8  9  10 11 12 ...
+   *   GF:           X        X        X        X
+   */
+  
+  uint16_t periodicity;        // Period in slots (e.g., 1,2,4,5,8,10,16,20,40,80,160...)
+                               // Smaller = lower latency, higher overhead
+                               // Larger = higher latency, lower overhead
+  
+  uint16_t offset;             // Slot offset within periodicity (0 to periodicity-1)
+                               // Used to avoid collisions when multiple UEs use same period
+  
+  uint8_t time_domain_allocation;  // Time Domain Resource Assignment index
+                                   // References PUSCH-TimeDomainResourceAllocationList
+                                   // For Phase 1, we use explicit start_symbol/nr_of_symbols
+  
+  uint8_t start_symbol;        // Starting OFDM symbol within slot (0-13)
+                               // Typically 2 or later to avoid DMRS/control regions
+  
+  uint8_t nr_of_symbols;       // Number of OFDM symbols for PUSCH (1-14)
+                               // Common values: 12-14 for maximum throughput
+  
+  uint8_t mapping_type;        // PUSCH mapping type: 0=Type A (slot-based), 1=Type B (mini-slot)
+                               // Type A: DMRS in symbol 2 or 3
+                               // Type B: DMRS in first symbol of allocation
+  
+  /* ========== Frequency Domain Configuration ========== 
+   * 
+   * Defines which PRBs (Physical Resource Blocks) are used for GF transmission.
+   * For Phase 1, we use contiguous allocation (Type 1).
+   * 
+   * Example with rb_start=10, rb_size=20, BWP_size=100:
+   *   PRB:  0  1  2 ... 9  10 11 12 ... 29 30 31 ... 99
+   *   GF:                   [=====GF=====]
+   */
+  
+  uint16_t rb_start;           // Starting PRB index within BWP (0 to BWP_size-1)
+  uint16_t rb_size;            // Number of contiguous PRBs (1 to BWP_size)
+  
+  uint8_t frequency_hopping;   // Frequency hopping: 0=disabled, 1=intra-slot, 2=inter-slot
+                               // For Phase 1, we disable frequency hopping (0)
+  
+  /* ========== Modulation and Coding ========== 
+   * 
+   * Fixed MCS for GF (no link adaptation in Phase 1)
+   * Trade-off: Higher MCS = more throughput but less reliability
+   */
+  
+  uint8_t mcs;                 // Modulation and Coding Scheme index (0-28)
+                               // MCS 0-9: QPSK
+                               // MCS 10-16: 16QAM  
+                               // MCS 17-28: 64QAM
+                               // For reliable GF, typically use conservative MCS (5-12)
+  
+  uint8_t mcs_table;           // MCS table: 0=Table1, 1=Table2 (lower SE), 2=Table3 (64QAM)
+                               // For Phase 1, use Table 1 (default)
+  
+  /* ========== HARQ Configuration ========== 
+   * 
+   * HARQ allows retransmission of failed packets.
+   * GF typically uses dedicated HARQ processes to avoid conflicts with dynamic grants.
+   */
+  
+  uint8_t harq_process_id;     // HARQ process ID (0 to NR_MAX_HARQ_PROCESSES-1)
+                               // Can be fixed or rotating based on implementation
+  
+  uint8_t rv_sequence[4];      // Redundancy Version sequence for retransmissions
+                               // Standard sequence: {0, 2, 3, 1}
+                               // Each retransmission uses next RV in sequence
+  
+  uint8_t ndi_toggle;          // New Data Indicator toggle state
+                               // Toggles between 0 and 1 for each new TB
+  
+  uint8_t repK;                // Number of repetitions (1, 2, 4, or 8)
+                               // For Phase 1, use 1 (no repetition)
+  
+  /* ========== DMRS Configuration ========== 
+   * 
+   * Demodulation Reference Signals for channel estimation at gNB
+   */
+  
+  uint8_t dmrs_config_type;    // DMRS type: 0=Type1 (6 RE/RB), 1=Type2 (4 RE/RB)
+  
+  uint8_t dmrs_ports;          // DMRS antenna port(s) - bitmap
+                               // For single layer: typically port 0 (value=1)
+  
+  uint16_t dmrs_scrambling_id; // DMRS scrambling ID (0-65535)
+                               // If 0, use physCellId as scrambling ID
+  
+  uint8_t num_dmrs_cdm_grps_no_data;  // Number of CDM groups without data (1 or 2)
+  
+  uint8_t dmrs_add_pos;        // Additional DMRS positions (0-3)
+                               // More DMRS = better channel tracking but less data capacity
+  
+  /* ========== Power Control ========== 
+   * 
+   * Transmit power settings for GF PUSCH
+   */
+  
+  int8_t delta_power;          // Power offset relative to normal PUSCH (dB)
+                               // Positive = higher power (more reliable)
+                               // Negative = lower power (less interference)
+  
+  bool transform_precoding;    // Enable DFT-s-OFDM (true) or CP-OFDM (false)
+                               // DFT-s-OFDM has lower PAPR, better for coverage
+  
+  /* ========== Identifiers ========== */
+  
+  uint8_t config_index;        // Configuration index (0 to NR_MAX_GF_CONFIGS-1)
+                               // Used when multiple GF configs are active
+  
+  uint16_t rnti;               // RNTI for GF transmission
+                               // Can be C-RNTI or dedicated CS-RNTI
+                               // If 0, use mac->crnti
+  
+  /* ========== Statistics (for debugging/monitoring) ========== */
+  
+  uint32_t tx_count;           // Total number of GF transmissions
+  uint32_t tx_with_data;       // Transmissions that carried actual data
+  uint32_t tx_empty;           // Transmissions with no data (empty or BSR only)
+  uint32_t harq_nack_count;    // Number of NACKs received
+  uint32_t harq_dtx_count;     // Number of DTX (no feedback)
+  
+} nr_gf_config_t;
+
+
+
+
+
 // PRACH occasion details
 typedef struct prach_occasion_info {
   int start_symbol; // 0 - 13 (14 symbols in a slot)
@@ -654,6 +803,12 @@ typedef struct NR_UE_MAC_INST_s {
   pthread_mutex_t if_mutex;
   ue_mac_stats_t stats;
   notifiedFIFO_t input_nf;
+
+  // ========== Grant-Free Configuration ==========
+  nr_gf_config_t gf_config[NR_MAX_GF_CONFIGS];  // Array of GF configurations
+  uint8_t num_gf_configs;                        // Number of active GF configs
+  bool gf_enabled;                               // Global GF enable flag
+
 } NR_UE_MAC_INST_t;
 
 static inline int GET_NTN_UE_K_OFFSET(const ntn_timing_advance_componets_t *ntn_ta, int scs)

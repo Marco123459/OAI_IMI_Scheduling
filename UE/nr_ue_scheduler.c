@@ -340,6 +340,378 @@ fapi_nr_ul_config_request_pdu_t *lockGet_ul_iterator(NR_UE_MAC_INST_t *mac, fram
   return fapiLockIterator(mac->ul_config_request + slot_tx, frame_tx, slot_tx);
 }
 
+/**
+ * @brief Check if current slot is a Grant-Free transmission occasion
+ * 
+ * This function iterates through all configured GF configurations and checks
+ * if the current (frame, slot) matches a GF transmission opportunity.
+ * 
+ * The GF occasion formula is:
+ *   is_occasion = ((absolute_slot - offset) % periodicity) == 0
+ * 
+ * Where absolute_slot = frame * slots_per_frame + slot
+ * 
+ * @param mac   Pointer to UE MAC instance
+ * @param frame Current frame number (0-1023)
+ * @param slot  Current slot number (0 to slots_per_frame-1)
+ * @return      Pointer to matching GF config, or NULL if no match
+ */
+nr_gf_config_t* nr_ue_check_grant_free_occasion(NR_UE_MAC_INST_t *mac, 
+                                                 frame_t frame, 
+                                                 int slot)
+{
+  // Early exit if GF not enabled globally
+  if (!mac->gf_enabled || mac->num_gf_configs == 0) {
+    return NULL;
+  }
+  
+  // Calculate absolute slot number (handles frame wraparound)
+  // This gives us a monotonically increasing slot count
+  int n_slots_frame = mac->frame_structure.numb_slots_frame;
+  int absolute_slot = frame * n_slots_frame + slot;
+  
+  // Check each configured GF
+  for (int i = 0; i < mac->num_gf_configs; i++) {
+    nr_gf_config_t *gf = &mac->gf_config[i];
+    
+    // Skip disabled or inactive configurations
+    if (!gf->enabled || !gf->active) {
+      continue;
+    }
+    
+    // Check if periodicity is valid (avoid division by zero)
+    if (gf->periodicity == 0) {
+      LOG_E(NR_MAC, "[UE %d] GF config %d has invalid periodicity 0\n", 
+            mac->ue_id, i);
+      continue;
+    }
+    
+    // Calculate if this slot matches the GF occasion
+    // Formula: (absolute_slot - offset) % periodicity == 0
+    // Handle negative offset by adding periodicity
+    int slot_diff = absolute_slot - gf->offset;
+    if (slot_diff < 0) {
+      // Not yet reached the first occasion
+      continue;
+    }
+    
+    if ((slot_diff % gf->periodicity) == 0) {
+      // This is a GF occasion! But first verify it's an UL slot
+      if (!is_ul_slot(slot, &mac->frame_structure)) {
+        LOG_W(NR_MAC, "[UE %d] GF occasion at %d.%d but slot is not UL\n",
+              mac->ue_id, frame, slot);
+        continue;
+      }
+      
+      LOG_D(NR_MAC, "[UE %d] GF occasion detected at frame %d slot %d (config %d, period=%d, offset=%d)\n",
+            mac->ue_id, frame, slot, i, gf->periodicity, gf->offset);
+      
+      return gf;  // Return first matching config
+    }
+  }
+  
+  return NULL;  // No GF occasion in this slot
+}
+
+
+/**
+ * @brief Configure PUSCH PDU using predefined Grant-Free parameters
+ * 
+ * This function fills the PUSCH PDU structure with parameters from the
+ * GF configuration. Unlike nr_config_pusch_pdu() which extracts parameters
+ * from DCI, this function uses the pre-configured values.
+ * 
+ * Key differences from dynamic grant:
+ * - No DCI parsing required
+ * - Fixed MCS (no link adaptation)
+ * - Dedicated HARQ process
+ * - Simplified power control
+ * 
+ * @param mac        Pointer to UE MAC instance
+ * @param gf         Pointer to Grant-Free configuration
+ * @param pusch_pdu  Pointer to PUSCH PDU structure to fill
+ * @param frame      Frame number for transmission
+ * @param slot       Slot number for transmission
+ * @return           0 on success, -1 on failure
+ */
+int nr_config_pusch_pdu_grant_free(NR_UE_MAC_INST_t *mac,
+                                    nr_gf_config_t *gf,
+                                    nfapi_nr_ue_pusch_pdu_t *pusch_pdu,
+                                    frame_t frame,
+                                    int slot)
+{
+  // Validate inputs
+  if (!mac || !gf || !pusch_pdu) {
+    LOG_E(NR_MAC, "Invalid parameters to nr_config_pusch_pdu_grant_free\n");
+    return -1;
+  }
+  
+  NR_UE_UL_BWP_t *current_UL_BWP = mac->current_UL_BWP;
+  if (!current_UL_BWP) {
+    LOG_E(NR_MAC, "[UE %d] No active UL BWP for GF transmission\n", mac->ue_id);
+    return -1;
+  }
+  
+  // Clear the PDU structure
+  memset(pusch_pdu, 0, sizeof(nfapi_nr_ue_pusch_pdu_t));
+  
+  /* ========== Basic PDU Configuration ========== */
+  
+  // RNTI: Use configured RNTI or fall back to C-RNTI
+  pusch_pdu->rnti = (gf->rnti != 0) ? gf->rnti : mac->crnti;
+  
+  // PDU bitmap: We're sending data
+  pusch_pdu->pdu_bit_map = PUSCH_PDU_BITMAP_PUSCH_DATA;
+  
+  // Handle (for tracking)
+  pusch_pdu->handle = 0;
+  
+  /* ========== BWP Configuration ========== */
+  
+  // BWP parameters from active UL BWP
+  pusch_pdu->bwp_start = current_UL_BWP->BWPStart;
+  pusch_pdu->bwp_size = current_UL_BWP->BWPSize;
+  pusch_pdu->subcarrier_spacing = current_UL_BWP->scs;
+  pusch_pdu->cyclic_prefix = 0;  // Normal CP
+  
+  /* ========== Frequency Domain Allocation ========== */
+  
+  // Validate RB allocation fits within BWP
+  if (gf->rb_start + gf->rb_size > current_UL_BWP->BWPSize) {
+    LOG_E(NR_MAC, "[UE %d] GF RB allocation (%d+%d) exceeds BWP size (%d)\n",
+          mac->ue_id, gf->rb_start, gf->rb_size, current_UL_BWP->BWPSize);
+    return -1;
+  }
+  
+  pusch_pdu->rb_start = gf->rb_start;
+  pusch_pdu->rb_size = gf->rb_size;
+  pusch_pdu->resource_alloc = 1;  // Type 1: contiguous allocation
+  pusch_pdu->vrb_to_prb_mapping = 0;  // Non-interleaved
+  
+  // Frequency hopping (disabled for Phase 1)
+  pusch_pdu->frequency_hopping = gf->frequency_hopping;
+  
+  /* ========== Time Domain Allocation ========== */
+  
+  // Validate symbol allocation
+  if (gf->start_symbol + gf->nr_of_symbols > 14) {
+    LOG_E(NR_MAC, "[UE %d] GF symbol allocation (%d+%d) exceeds slot length\n",
+          mac->ue_id, gf->start_symbol, gf->nr_of_symbols);
+    return -1;
+  }
+  
+  pusch_pdu->start_symbol_index = gf->start_symbol;
+  pusch_pdu->nr_of_symbols = gf->nr_of_symbols;
+  
+  /* ========== MCS and Layers ========== */
+  
+  pusch_pdu->mcs_index = gf->mcs;
+  pusch_pdu->mcs_table = gf->mcs_table;  // 0 = Table 1
+  pusch_pdu->nrOfLayers = 1;  // Single layer for Phase 1
+  pusch_pdu->Tpmi = 0;  // No precoding
+  
+  // Get Qm (modulation order) from MCS
+  pusch_pdu->qam_mod_order = nr_get_Qm_ul(gf->mcs, gf->mcs_table);
+  if (pusch_pdu->qam_mod_order == 0) {
+    LOG_E(NR_MAC, "[UE %d] Invalid QAM modulation order for MCS %d\n",
+          mac->ue_id, gf->mcs);
+    return -1;
+  }
+  
+  // Get code rate from MCS
+  pusch_pdu->target_code_rate = nr_get_code_rate_ul(gf->mcs, gf->mcs_table);
+  if (pusch_pdu->target_code_rate == 0) {
+    LOG_E(NR_MAC, "[UE %d] Invalid code rate for MCS %d\n",
+          mac->ue_id, gf->mcs);
+    return -1;
+  }
+  
+  /* ========== HARQ Configuration ========== */
+  
+  pusch_pdu->pusch_data.harq_process_id = gf->harq_process_id;
+  pusch_pdu->pusch_data.new_data_indicator = gf->ndi_toggle;
+  
+  // RV for initial transmission (retransmissions will use sequence)
+  NR_UE_UL_HARQ_INFO_t *harq = &mac->ul_harq_info[gf->harq_process_id];
+  int rv_index = (harq->round < 4) ? harq->round : 3;
+  pusch_pdu->pusch_data.rv_index = gf->rv_sequence[rv_index];
+  
+  /* ========== DMRS Configuration ========== */
+  
+  pusch_pdu->dmrs_config_type = gf->dmrs_config_type;  // Type 1 or Type 2
+  pusch_pdu->dmrs_ports = gf->dmrs_ports;
+  pusch_pdu->scid = 0;  // Scrambling ID index
+  
+  // Use configured scrambling ID or fall back to PCI
+  pusch_pdu->ul_dmrs_scrambling_id = (gf->dmrs_scrambling_id != 0) ? 
+                                      gf->dmrs_scrambling_id : mac->physCellId;
+  pusch_pdu->data_scrambling_id = mac->physCellId;
+  
+  // Number of CDM groups without data
+  pusch_pdu->num_dmrs_cdm_grps_no_data = gf->num_dmrs_cdm_grps_no_data;
+  if (pusch_pdu->num_dmrs_cdm_grps_no_data == 0) {
+    pusch_pdu->num_dmrs_cdm_grps_no_data = 2;  // Default
+  }
+  
+  // Calculate DMRS symbol positions
+  // Using mapping type B (mini-slot based) for flexibility
+  pusch_dmrs_AdditionalPosition_t add_pos = gf->dmrs_add_pos;
+  if (add_pos > pusch_dmrs_pos3) {
+    add_pos = pusch_dmrs_pos2;  // Default
+  }
+  
+  pusch_pdu->ul_dmrs_symb_pos = get_l_prime(gf->nr_of_symbols,
+                                            gf->mapping_type,  // 0=TypeA, 1=TypeB
+                                            add_pos,
+                                            pusch_len1,  // Single-symbol DMRS
+                                            gf->start_symbol,
+                                            mac->dmrs_TypeA_Position);
+  
+  /* ========== Transform Precoding ========== */
+  
+  pusch_pdu->transform_precoding = gf->transform_precoding ? 1 : 0;
+  
+  /* ========== TBS Calculation ========== */
+  
+  // Calculate number of DMRS REs
+  int number_dmrs_symbols = __builtin_popcount(pusch_pdu->ul_dmrs_symb_pos);
+  int nb_dmrs_re_per_rb = (pusch_pdu->dmrs_config_type == 0) ? 6 : 4;  // Type1:6, Type2:4
+  nb_dmrs_re_per_rb *= pusch_pdu->num_dmrs_cdm_grps_no_data;
+  
+  // Calculate TBS
+  pusch_pdu->pusch_data.tb_size = nr_compute_tbs(pusch_pdu->qam_mod_order,
+                                                  pusch_pdu->target_code_rate,
+                                                  gf->rb_size,
+                                                  gf->nr_of_symbols,
+                                                  nb_dmrs_re_per_rb * number_dmrs_symbols,
+                                                  0,  // N_PRB_oh (no overhead)
+                                                  0,  // tb_scaling
+                                                  1)  // nrOfLayers
+                                   >> 3;  // Convert bits to bytes
+  
+  if (pusch_pdu->pusch_data.tb_size == 0) {
+    LOG_E(NR_MAC, "[UE %d] TBS calculation resulted in 0 bytes\n", mac->ue_id);
+    return -1;
+  }
+  
+  // Store TBS in HARQ info for retransmissions
+  harq->TBS = pusch_pdu->pusch_data.tb_size;
+  harq->R = pusch_pdu->target_code_rate;
+  
+  /* ========== Power Control ========== */
+  
+  // For Phase 1, use default power calculation
+  // Full power control will be added in later phases
+  pusch_pdu->tx_power = 0;  // Will be computed by PHY or later in the flow
+  
+  /* ========== Rate Matching / TBSLBRM ========== */
+  
+  pusch_pdu->tbslbrm = 0;  // Disable TB size LBRM for Phase 1
+  
+  /* ========== Logging ========== */
+  
+  LOG_I(NR_MAC, "[UE %d] GF PUSCH configured: frame %d slot %d\n"
+        "        RBs: %d-%d (%d PRBs), Symbols: %d-%d (%d symbols)\n"
+        "        MCS: %d (Qm=%d, R=%d), TBS: %d bytes\n"
+        "        HARQ: pid=%d, ndi=%d, rv=%d, round=%d\n"
+        "        DMRS: type=%d, ports=%d, pos=0x%04x\n",
+        mac->ue_id, frame, slot,
+        pusch_pdu->rb_start, pusch_pdu->rb_start + pusch_pdu->rb_size - 1, pusch_pdu->rb_size,
+        pusch_pdu->start_symbol_index, 
+        pusch_pdu->start_symbol_index + pusch_pdu->nr_of_symbols - 1,
+        pusch_pdu->nr_of_symbols,
+        pusch_pdu->mcs_index, pusch_pdu->qam_mod_order, pusch_pdu->target_code_rate,
+        pusch_pdu->pusch_data.tb_size,
+        pusch_pdu->pusch_data.harq_process_id, pusch_pdu->pusch_data.new_data_indicator,
+        pusch_pdu->pusch_data.rv_index, harq->round,
+        pusch_pdu->dmrs_config_type, pusch_pdu->dmrs_ports, pusch_pdu->ul_dmrs_symb_pos);
+  
+  return 0;
+}
+
+/**
+ * @brief Main Grant-Free scheduler function
+ * 
+ * This function is called from nr_ue_ul_scheduler() at the beginning of each
+ * UL slot processing. It checks if the current slot is a GF occasion and
+ * if so, configures and adds a PUSCH PDU to the ul_config.
+ * 
+ * The function performs:
+ * 1. Check if this slot is a GF occasion
+ * 2. Optionally check if there's data to transmit (Phase 2+)
+ * 3. Configure PUSCH PDU using GF parameters
+ * 4. Add PUSCH PDU to ul_config
+ * 
+ * 
+ * @param mac   Pointer to UE MAC instance
+ * @param frame Frame number
+ * @param slot  Slot number
+ */
+void nr_ue_schedule_grant_free(NR_UE_MAC_INST_t *mac, frame_t frame, int slot)
+{
+  // Check if this is a GF occasion
+  nr_gf_config_t *gf = nr_ue_check_grant_free_occasion(mac, frame, slot);
+  if (!gf) {
+    return;  // Not a GF occasion
+  }
+  
+  /* ========== Phase 2+: Check for Data ========== */
+  /*
+   * In later phases, we'll check if there's actually data to transmit:
+   * 
+   * bool has_data = false;
+   * for (int i = 0; i < mac->lc_ordered_list.count; i++) {
+   *   nr_lcordered_info_t *lc_info = mac->lc_ordered_list.array[i];
+   *   NR_LC_SCHEDULING_INFO *lc_sched_info = get_scheduling_info_from_lcid(mac, lc_info->lcid);
+   *   if (lc_sched_info->LCID_buffer_remain > 0) {
+   *     has_data = true;
+   *     break;
+   *   }
+   * }
+   * 
+   * if (!has_data) {
+   *   LOG_D(NR_MAC, "[UE %d] GF occasion at %d.%d but no data\n", mac->ue_id, frame, slot);
+   *   gf->tx_empty++;
+   *   return;  // Or send empty BSR
+   * }
+   */
+  
+  /* ========== Allocate UL Config PDU ========== */
+  
+  fapi_nr_ul_config_request_pdu_t *pdu = lockGet_ul_config(mac, frame, slot, 
+                                                           FAPI_NR_UL_CONFIG_TYPE_PUSCH);
+  if (!pdu) {
+    LOG_E(NR_MAC, "[UE %d] Failed to allocate UL config PDU for GF at %d.%d\n",
+          mac->ue_id, frame, slot);
+    return;
+  }
+  
+  /* ========== Configure PUSCH PDU ========== */
+  
+  int ret = nr_config_pusch_pdu_grant_free(mac, gf, &pdu->pusch_config_pdu, frame, slot);
+  if (ret != 0) {
+    LOG_E(NR_MAC, "[UE %d] Failed to configure GF PUSCH PDU at %d.%d\n",
+          mac->ue_id, frame, slot);
+    remove_ul_config_last_item(pdu);
+    release_ul_config(pdu, false);
+    return;
+  }
+  
+  /* ========== Release Lock ========== */
+  
+  release_ul_config(pdu, false);
+  
+  /* ========== Update Statistics ========== */
+  
+  gf->tx_count++;
+  
+  LOG_I(NR_MAC, "[UE %d] GF PUSCH scheduled at %d.%d (total tx: %d)\n",
+        mac->ue_id, frame, slot, gf->tx_count);
+}
+
+
+
+
 /*
  * This function returns the DL config corresponding to a given DL slot
  * from MAC instance .
@@ -1211,6 +1583,42 @@ static void nr_update_sr(NR_UE_MAC_INST_t *mac, bool BSRsent)
 {
   NR_UE_SCHEDULING_INFO *sched_info = &mac->scheduling_info;
 
+  /* ========================================================================
+   * GRANT-FREE CHECK
+   * 
+   * If Grant-Free is enabled and active, skip ALL SR processing.
+   * The UE will transmit data on predefined GF occasions instead.
+   * ======================================================================== */
+  if (mac->gf_enabled && mac->num_gf_configs > 0) {
+    // Check if at least one GF config is active
+    bool gf_active = false;
+    for (int i = 0; i < mac->num_gf_configs; i++) {
+      if (mac->gf_config[i].enabled && mac->gf_config[i].active) {
+        gf_active = true;
+        break;
+      }
+    }
+    
+    if (gf_active) {
+      LOG_D(NR_MAC, "[UE %d] Grant-Free active - SR suppressed (Pure GF Mode)\n", 
+            mac->ue_id);
+      
+      // Cancel any pending SRs since we won't need them
+      for (int i = 0; i < NR_MAX_SR_ID; i++) {
+        if (sched_info->sr_info[i].pending) {
+          LOG_D(NR_MAC, "[UE %d] Cancelling pending SR ID %d (GF active)\n", 
+                mac->ue_id, i);
+          sched_info->sr_info[i].pending = false;
+          sched_info->sr_info[i].counter = 0;
+          nr_timer_stop(&sched_info->sr_info[i].prohibitTimer);
+        }
+      }
+      
+      return;  // Skip all SR processing
+    }
+  }
+
+
   // if no pending data available for transmission
   // All pending SR(s) shall be cancelled and each respective sr-ProhibitTimer shall be stopped
   // in TS 38.321:
@@ -1366,10 +1774,18 @@ void nr_ue_ul_scheduler(NR_UE_MAC_INST_t *mac, nr_uplink_indication_t *ul_info)
   if (mac->state == UE_PERFORMING_RA && ra->ra_state == nrRA_GENERATE_PREAMBLE)
     nr_ue_prach_scheduler(mac, frame_tx, slot_tx);
 
-  bool BSRsent = false;
-  if (mac->state == UE_CONNECTED) {
-    nr_ue_periodic_srs_scheduling(mac, frame_tx, slot_tx);
-    nr_update_rlc_buffers_status(mac, frame_tx, slot_tx, gNB_index);
+    bool BSRsent = false;
+    if (mac->state == UE_CONNECTED) {
+    // ========== GRANT-FREE SCHEDULING ==========
+    // Check and schedule Grant-Free transmission before dynamic grants
+    // GF has priority over dynamic scheduling
+      if (mac->gf_enabled && mac->num_gf_configs > 0) {
+        nr_ue_schedule_grant_free(mac, frame_tx, slot_tx);
+      }
+    // ========== END GRANT-FREE ==========
+      
+      nr_ue_periodic_srs_scheduling(mac, frame_tx, slot_tx);
+      nr_update_rlc_buffers_status(mac, frame_tx, slot_tx, gNB_index);
   }
 
   // Schedule ULSCH only if the current frame and slot match those in ul_config_req
@@ -1503,6 +1919,76 @@ void nr_ue_ul_scheduler(NR_UE_MAC_INST_t *mac, nr_uplink_indication_t *ul_info)
     }
   }
 }
+
+
+
+
+/**
+ * @brief Handle HARQ feedback for Grant-Free transmissions
+ * 
+ * Processes ACK/NACK feedback and updates GF state accordingly.
+ * - ACK: Toggle NDI, reset round counter, ready for new data
+ * - NACK: Increment round, schedule retransmission with next RV
+ * - DTX: Treat as NACK (no feedback received)
+ * 
+ * @param mac           Pointer to UE MAC instance
+ * @param gf            Pointer to Grant-Free configuration
+ * @param harq_feedback Feedback value: 1=ACK, 0=NACK, -1=DTX
+ */
+void nr_ue_gf_harq_handler(NR_UE_MAC_INST_t *mac, 
+                            nr_gf_config_t *gf,
+                            int harq_feedback)
+{
+  if (!gf || !gf->enabled) {
+    return;
+  }
+  
+  NR_UE_UL_HARQ_INFO_t *harq = &mac->ul_harq_info[gf->harq_process_id];
+  
+  if (harq_feedback == 1) {
+    // ACK received - transmission successful
+    LOG_D(NR_MAC, "[UE %d] GF HARQ ACK for process %d\n",
+          mac->ue_id, gf->harq_process_id);
+    
+    // Toggle NDI for next transmission
+    gf->ndi_toggle ^= 1;
+    
+    // Reset round counter
+    harq->round = 0;
+    
+    // Update statistics
+    // gf->harq_ack_count++;  // Will add in later phase
+    
+  } else {
+    // NACK or DTX - need retransmission
+    if (harq_feedback == 0) {
+      LOG_D(NR_MAC, "[UE %d] GF HARQ NACK for process %d, round %d\n",
+            mac->ue_id, gf->harq_process_id, harq->round);
+      gf->harq_nack_count++;
+    } else {
+      LOG_D(NR_MAC, "[UE %d] GF HARQ DTX for process %d, round %d\n",
+            mac->ue_id, gf->harq_process_id, harq->round);
+      gf->harq_dtx_count++;
+    }
+    
+    // Increment round counter
+    harq->round++;
+    
+    // Check if max retransmissions reached
+    if (harq->round >= 4) {
+      LOG_W(NR_MAC, "[UE %d] GF max retransmissions reached for process %d\n",
+            mac->ue_id, gf->harq_process_id);
+      
+      // Give up on this TB, toggle NDI and reset
+      gf->ndi_toggle ^= 1;
+      harq->round = 0;
+    }
+    // Note: Retransmission will happen automatically on next GF occasion
+    // with the appropriate RV from gf->rv_sequence[harq->round]
+  }
+}
+
+
 
 static uint8_t nr_locate_BsrIndexByBufferSize(int size, int value)
 {

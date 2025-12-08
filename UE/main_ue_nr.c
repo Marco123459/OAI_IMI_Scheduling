@@ -88,6 +88,12 @@ void nr_ue_init_mac(NR_UE_MAC_INST_t *mac)
 
   mac->pucch_power_control_initialized = false;
   mac->pusch_power_control_initialized = false;
+
+  // ========== Grant-Free Initialization ==========
+  mac->gf_enabled = false;
+  mac->num_gf_configs = 0;
+  memset(mac->gf_config, 0, sizeof(mac->gf_config));
+  // ========== End Grant-Free Init ==========
 }
 
 void nr_ue_mac_default_configs(NR_UE_MAC_INST_t *mac)
@@ -237,6 +243,20 @@ void reset_mac_inst(NR_UE_MAC_INST_t *nr_mac)
 
   // reset BFI_COUNTER
   // TODO beam failure procedure not implemented
+
+  // ========== Reset Grant-Free State ==========
+  // Reset GF statistics but keep configurations
+  for (int i = 0; i < NR_MAX_GF_CONFIGS; i++) {
+    if (nr_mac->gf_config[i].enabled) {
+      nr_mac->gf_config[i].ndi_toggle = 0;
+      nr_mac->gf_config[i].tx_count = 0;
+      nr_mac->gf_config[i].tx_with_data = 0;
+      nr_mac->gf_config[i].tx_empty = 0;
+      nr_mac->gf_config[i].harq_nack_count = 0;
+      nr_mac->gf_config[i].harq_dtx_count = 0;
+    }
+  }
+  // ========== End Grant-Free Reset ==========
   
 }
 
@@ -310,4 +330,16 @@ void release_mac_configuration(NR_UE_MAC_INST_t *mac, NR_UE_MAC_reset_cause_t ca
   memset(&mac->ul_time_alignment, 0, sizeof(mac->ul_time_alignment));
   for (int i = mac->TAG_list.count; i > 0 ; i--)
     asn_sequence_del(&mac->TAG_list, i - 1, 1);
+  
+  // ========== Release Grant-Free Configurations ==========
+  if (cause == GO_TO_IDLE) {
+    for (int i = 0; i < NR_MAX_GF_CONFIGS; i++) {
+      if (mac->gf_config[i].enabled) {
+        nr_ue_release_grant_free(mac, i);
+      }
+    }
+    mac->gf_enabled = false;
+    mac->num_gf_configs = 0;
+  }
+  // ========== End Release Grant-Free ==========
 }
