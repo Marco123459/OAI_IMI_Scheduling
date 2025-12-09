@@ -31,6 +31,9 @@
 #ifndef __LAYER2_NR_MAC_PROTO_H__
 #define __LAYER2_NR_MAC_PROTO_H__
 
+#ifndef NR_GF_GNB_PROTO_H
+#define NR_GF_GNB_PROTO_H
+
 #include "LAYER2/NR_MAC_gNB/nr_mac_gNB.h"
 #include "NR_TAG-Id.h"
 #include "common/ngran_types.h"
@@ -509,4 +512,248 @@ void prepare_du_configuration_update(gNB_MAC_INST *mac,
 void nr_mac_clean_cellgroup(NR_CellGroupConfig_t *cell_group);
 
 void post_process_ulsch(gNB_MAC_INST *nr_mac, post_process_pusch_t *pusch, NR_UE_info_t *UE, NR_sched_pusch_t *sched_pusch);
+
+/**
+ * @brief Initialize the Grant-Free manager at gNB
+ * @param gNB  Pointer to gNB MAC instance
+ * 
+ * Called during gNB initialization to set up GF structures.
+ */
+void nr_gf_gnb_init(gNB_MAC_INST *gNB);
+
+/**
+ * @brief Configure Grant-Free for a specific UE
+ * @param gNB       Pointer to gNB MAC instance
+ * @param ue_id     UE identifier (internal index)
+ * @param rnti      UE RNTI
+ * @param gf_config GF configuration parameters
+ * @return Config index on success (0 to NR_MAX_GF_CONFIGS_PER_UE-1), -1 on failure
+ * 
+ * Adds a new GF configuration for the specified UE.
+ * Multiple GF configurations can be added per UE.
+ */
+int nr_gf_gnb_configure_ue(gNB_MAC_INST *gNB,
+                            int ue_id,
+                            rnti_t rnti,
+                            nr_gf_gnb_ue_config_t *gf_config);
+
+/**
+ * @brief Release Grant-Free configuration for a UE
+ * @param gNB          Pointer to gNB MAC instance
+ * @param ue_id        UE identifier
+ * @param config_index GF configuration index (-1 for all configs)
+ */
+void nr_gf_gnb_release_ue(gNB_MAC_INST *gNB, int ue_id, int config_index);
+
+/**
+ * @brief Activate/Deactivate Grant-Free for a UE
+ * @param gNB          Pointer to gNB MAC instance
+ * @param ue_id        UE identifier
+ * @param config_index GF configuration index (-1 for all)
+ * @param active       true to activate, false to deactivate
+ */
+void nr_gf_gnb_set_active(gNB_MAC_INST *gNB, int ue_id, 
+                           int config_index, bool active);
+
+/**
+ * @brief Configure default GF for testing
+ * @param gNB    Pointer to gNB MAC instance
+ * @param ue_id  UE identifier
+ * @param rnti   UE RNTI
+ * 
+ * Sets up a default GF configuration matching the UE-side defaults.
+ * Used for testing/development.
+ */
+void nr_gf_gnb_configure_default(gNB_MAC_INST *gNB, int ue_id, rnti_t rnti);
+
+
+/* ============================================================================
+ * SLOT PROCESSING
+ * ============================================================================
+ */
+
+/**
+ * @brief Check for GF occasions in the current slot
+ * @param gNB    Pointer to gNB MAC instance
+ * @param frame  Current frame number
+ * @param slot   Current slot number
+ * @param info   Output: Information about expected GF transmissions
+ * @return Number of UEs expected to transmit (0 if no GF occasion)
+ * 
+ * Scans all configured GF UEs and determines which ones are expected
+ * to transmit in the current slot.
+ */
+int nr_gf_gnb_check_occasions(gNB_MAC_INST *gNB,
+                               frame_t frame,
+                               int slot,
+                               nr_gf_gnb_slot_info_t *info);
+
+/**
+ * @brief Schedule GF PUSCH reception
+ * @param gNB    Pointer to gNB MAC instance
+ * @param frame  Current frame number
+ * @param slot   Current slot number
+ * @param info   GF slot information from nr_gf_gnb_check_occasions()
+ * 
+ * Configures PHY to receive PUSCH on GF resources.
+ * Adds GF PUSCH to the reception list.
+ */
+void nr_gf_gnb_schedule_reception(gNB_MAC_INST *gNB,
+                                   frame_t frame,
+                                   int slot,
+                                   nr_gf_gnb_slot_info_t *info);
+
+/**
+ * @brief Main GF processing function for each slot
+ * @param gNB    Pointer to gNB MAC instance
+ * @param frame  Current frame number
+ * @param slot   Current slot number
+ * 
+ * Called from gNB_dlsch_ulsch_scheduler() to handle all GF processing.
+ * This is the main entry point for GF handling in each slot.
+ */
+void nr_gf_gnb_slot_process(gNB_MAC_INST *gNB, frame_t frame, int slot);
+
+
+/* ============================================================================
+ * PUSCH RECEPTION HANDLING
+ * ============================================================================
+ */
+
+/**
+ * @brief Configure PUSCH PDU for GF reception
+ * @param gNB        Pointer to gNB MAC instance
+ * @param gf_config  GF configuration for the UE
+ * @param pusch_pdu  PUSCH PDU to configure
+ * @param frame      Frame number
+ * @param slot       Slot number
+ * @return 0 on success, -1 on failure
+ * 
+ * Fills PUSCH PDU structure with GF parameters for PHY reception.
+ */
+int nr_gf_gnb_config_pusch_pdu(gNB_MAC_INST *gNB,
+                                nr_gf_gnb_ue_config_t *gf_config,
+                                nfapi_nr_pusch_pdu_t *pusch_pdu,
+                                frame_t frame,
+                                int slot);
+
+/**
+ * @brief Process received GF PUSCH
+ * @param gNB         Pointer to gNB MAC instance
+ * @param ue_id       UE identifier
+ * @param harq_pid    HARQ process ID
+ * @param crc_valid   true if CRC passed
+ * @param mac_pdu     Pointer to received MAC PDU (if CRC valid)
+ * @param pdu_length  Length of MAC PDU
+ * @param sinr_db     Measured SINR in dB
+ * 
+ * Called after PHY decodes the GF PUSCH.
+ * Processes the MAC PDU and schedules HARQ feedback.
+ */
+void nr_gf_gnb_process_rx(gNB_MAC_INST *gNB,
+                           int ue_id,
+                           uint8_t harq_pid,
+                           bool crc_valid,
+                           uint8_t *mac_pdu,
+                           uint32_t pdu_length,
+                           int8_t sinr_db);
+
+
+/* ============================================================================
+ * HARQ FEEDBACK
+ * ============================================================================
+ */
+
+/**
+ * @brief Schedule HARQ feedback for GF transmission
+ * @param gNB       Pointer to gNB MAC instance
+ * @param ue_id     UE identifier
+ * @param harq_pid  HARQ process ID
+ * @param ack       true for ACK, false for NACK
+ * @param rx_frame  Frame when PUSCH was received
+ * @param rx_slot   Slot when PUSCH was received
+ * 
+ * Schedules ACK/NACK to be sent to UE.
+ * Timing follows K1-like rules (feedback after fixed delay).
+ */
+void nr_gf_gnb_schedule_harq_feedback(gNB_MAC_INST *gNB,
+                                       int ue_id,
+                                       uint8_t harq_pid,
+                                       bool ack,
+                                       frame_t rx_frame,
+                                       int rx_slot);
+
+/**
+ * @brief Send pending HARQ feedback
+ * @param gNB    Pointer to gNB MAC instance
+ * @param frame  Current frame number
+ * @param slot   Current slot number
+ * 
+ * Checks for pending HARQ feedback scheduled for this slot
+ * and sends it (via DCI or other mechanism).
+ */
+void nr_gf_gnb_send_harq_feedback(gNB_MAC_INST *gNB,
+                                   frame_t frame,
+                                   int slot);
+
+/**
+ * @brief Update HARQ state after feedback
+ * @param gNB       Pointer to gNB MAC instance
+ * @param ue_id     UE identifier
+ * @param harq_pid  HARQ process ID
+ * @param ack       Was ACK sent?
+ * 
+ * Updates internal HARQ state tracking after feedback is sent.
+ */
+void nr_gf_gnb_update_harq_state(gNB_MAC_INST *gNB,
+                                  int ue_id,
+                                  uint8_t harq_pid,
+                                  bool ack);
+
+
+/* ============================================================================
+ * STATISTICS & DEBUGGING
+ * ============================================================================
+ */
+
+/**
+ * @brief Get GF statistics for a UE
+ * @param gNB          Pointer to gNB MAC instance
+ * @param ue_id        UE identifier
+ * @param config_index GF configuration index
+ * @param stats        Output: Statistics structure
+ */
+void nr_gf_gnb_get_ue_stats(gNB_MAC_INST *gNB,
+                             int ue_id,
+                             int config_index,
+                             nr_gf_gnb_ue_config_t *stats);
+
+/**
+ * @brief Get global GF statistics
+ * @param gNB   Pointer to gNB MAC instance
+ * @param stats Output: Global statistics
+ */
+void nr_gf_gnb_get_global_stats(gNB_MAC_INST *gNB,
+                                 nr_gf_gnb_manager_t *stats);
+
+/**
+ * @brief Reset statistics
+ * @param gNB    Pointer to gNB MAC instance
+ * @param ue_id  UE identifier (-1 for global stats)
+ */
+void nr_gf_gnb_reset_stats(gNB_MAC_INST *gNB, int ue_id);
+
+/**
+ * @brief Print GF configuration to log
+ * @param gNB    Pointer to gNB MAC instance
+ * @param ue_id  UE identifier (-1 for all)
+ */
+void nr_gf_gnb_dump_config(gNB_MAC_INST *gNB, int ue_id);
+
+/**
+ * @brief Print GF statistics to log
+ * @param gNB  Pointer to gNB MAC instance
+ */
+void nr_gf_gnb_print_stats(gNB_MAC_INST *gNB);
+
 #endif /*__LAYER2_NR_MAC_PROTO_H__*/

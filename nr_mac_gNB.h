@@ -100,6 +100,195 @@
 #define MAX_NUM_OF_SSB 64
 #define MAX_NUM_NR_PRACH_PREAMBLES 64
 
+#ifndef NR_GF_GNB_DEFS_H
+#define NR_GF_GNB_DEFS_H
+
+/* ============================================================================
+ * CONSTANTS
+ * ============================================================================
+ */
+
+// Maximum number of GF configurations per UE
+#define NR_MAX_GF_CONFIGS_PER_UE  4
+
+// Maximum number of UEs with GF configured
+#define NR_MAX_GF_UES  32
+
+// Maximum GF transmissions expected in a single slot (across all UEs)
+#define NR_MAX_GF_PER_SLOT  8
+
+/* ============================================================================
+ * STRUCTURE: nr_gf_gnb_ue_config_t
+ * 
+ * Grant-Free configuration for a single UE, stored at gNB.
+ * This mirrors the UE-side nr_gf_config_t structure.
+ * ============================================================================
+ */
+typedef struct nr_gf_gnb_ue_config {
+  // ========== Enable/Status ==========
+  bool enabled;                    // GF enabled for this UE
+  bool active;                     // GF currently active
+  
+  // ========== UE Identification ==========
+  rnti_t rnti;                     // UE RNTI
+  int ue_id;                       // Internal UE ID (index in UE_info)
+  
+  // ========== Time Domain ==========
+  uint16_t periodicity;            // Period in slots
+  uint16_t offset;                 // Slot offset within period
+  uint8_t start_symbol;            // Starting OFDM symbol (0-13)
+  uint8_t nr_of_symbols;           // Number of symbols
+  uint8_t mapping_type;            // Type A (0) or Type B (1)
+  
+  // ========== Frequency Domain ==========
+  uint16_t rb_start;               // Starting PRB in BWP
+  uint16_t rb_size;                // Number of PRBs
+  uint8_t frequency_hopping;       // 0 = disabled
+  
+  // ========== MCS/Modulation ==========
+  uint8_t mcs;                     // MCS index (0-28)
+  uint8_t mcs_table;               // MCS table (0, 1, or 2)
+  uint8_t target_code_rate;        // Target code rate (derived from MCS)
+  uint8_t qam_order;               // Modulation order (2=QPSK, 4=16QAM, 6=64QAM)
+  
+  // ========== HARQ ==========
+  uint8_t harq_process_id;         // Dedicated HARQ process for this GF config
+  uint8_t rv_sequence[4];          // Expected RV sequence {0, 2, 3, 1}
+  uint8_t expected_ndi;            // Expected NDI for next new transmission
+  uint8_t current_round;           // Current retransmission round (gNB tracking)
+  
+  // ========== DMRS ==========
+  uint8_t dmrs_config_type;        // Type 1 or Type 2
+  uint8_t dmrs_ports;              // DMRS port bitmap
+  uint16_t dmrs_scrambling_id;     // Scrambling ID (usually = N_ID_cell)
+  uint8_t num_dmrs_cdm_grps_no_data;
+  uint8_t dmrs_symbol_positions;   // Bitmap of DMRS symbol positions
+  
+  // ========== TBS (Pre-calculated) ==========
+  uint32_t expected_tbs;           // Expected TBS based on config
+  
+  // ========== Statistics ==========
+  uint32_t rx_count;               // Total reception attempts
+  uint32_t rx_success;             // Successful decodes (CRC OK)
+  uint32_t rx_failure;             // Failed decodes (CRC error)
+  uint32_t harq_ack_sent;          // ACKs sent
+  uint32_t harq_nack_sent;         // NACKs sent
+  uint64_t total_bytes_received;   // Total bytes successfully received
+  
+  // ========== Last Reception Info ==========
+  frame_t last_rx_frame;           // Frame of last reception attempt
+  int last_rx_slot;                // Slot of last reception attempt
+  bool last_rx_success;            // Result of last reception
+  int8_t last_sinr_db;             // SINR of last reception (dB, signed)
+  
+} nr_gf_gnb_ue_config_t;
+
+
+/* ============================================================================
+ * STRUCTURE: nr_gf_gnb_slot_info_t
+ * 
+ * Information about GF transmissions expected in a specific slot.
+ * Used during slot processing to know which UEs to expect.
+ * ============================================================================
+ */
+typedef struct nr_gf_gnb_slot_info {
+  int num_expected;                              // Number of UEs expected
+  nr_gf_gnb_ue_config_t *configs[NR_MAX_GF_PER_SLOT];  // Pointers to configs
+} nr_gf_gnb_slot_info_t;
+
+
+/* ============================================================================
+ * STRUCTURE: nr_gf_gnb_manager_t
+ * 
+ * Main Grant-Free manager structure at gNB.
+ * Holds all GF configurations and global state.
+ * ============================================================================
+ */
+typedef struct nr_gf_gnb_manager {
+  // ========== Global Enable ==========
+  bool gf_enabled;                 // Global GF enable flag
+  
+  // ========== UE Configurations ==========
+  nr_gf_gnb_ue_config_t ue_configs[NR_MAX_GF_UES][NR_MAX_GF_CONFIGS_PER_UE];
+  uint8_t num_configs_per_ue[NR_MAX_GF_UES];  // Number of GF configs per UE
+  uint8_t num_gf_ues;              // Total UEs with GF configured
+  
+  // ========== Quick Lookup ==========
+  // Bitmap of slots that have GF occasions (within one period)
+  // For faster checking during slot processing
+  uint64_t gf_slot_bitmap;         // Bit i = 1 if slot i has GF occasion
+  uint16_t max_periodicity;        // Maximum periodicity across all configs
+  
+  // ========== HARQ Management ==========
+  // Track which HARQ processes are used for GF (to avoid conflicts)
+  uint16_t gf_harq_process_bitmap; // Bit i = 1 if HARQ i used for GF
+  
+  // ========== Global Statistics ==========
+  uint64_t total_gf_occasions;     // Total GF occasions processed
+  uint64_t total_gf_receptions;    // Total reception attempts
+  uint64_t total_gf_successes;     // Total successful decodes
+  uint64_t total_gf_collisions;    // Detected collisions (multiple UEs same RB)
+  
+} nr_gf_gnb_manager_t;
+
+
+/* ============================================================================
+ * STRUCTURE: nr_gf_pusch_reception_t
+ * 
+ * Structure to pass GF PUSCH reception info to PHY layer.
+ * ============================================================================
+ */
+typedef struct nr_gf_pusch_reception {
+  // UE identification
+  rnti_t rnti;
+  int ue_id;
+  
+  // Time/Frequency allocation
+  uint16_t rb_start;
+  uint16_t rb_size;
+  uint8_t start_symbol;
+  uint8_t nr_of_symbols;
+  
+  // Transmission parameters
+  uint8_t mcs;
+  uint8_t mcs_table;
+  uint32_t tbs;
+  
+  // HARQ
+  uint8_t harq_process_id;
+  uint8_t rv;
+  uint8_t ndi;
+  
+  // DMRS
+  uint8_t dmrs_config_type;
+  uint8_t dmrs_ports;
+  uint16_t dmrs_scrambling_id;
+  uint8_t num_dmrs_cdm_grps_no_data;
+  uint16_t dmrs_symbol_bitmap;
+  
+  // Flags
+  bool is_grant_free;              // Mark as GF (vs dynamic grant)
+  bool is_retransmission;          // Is this a retransmission?
+  
+} nr_gf_pusch_reception_t;
+
+
+/* ============================================================================
+ * STRUCTURE: nr_gf_harq_feedback_t
+ * 
+ * HARQ feedback to be sent for GF transmission.
+ * ============================================================================
+ */
+typedef struct nr_gf_harq_feedback {
+  rnti_t rnti;
+  int ue_id;
+  uint8_t harq_process_id;
+  bool ack;                        // true = ACK, false = NACK
+  frame_t feedback_frame;          // Frame to send feedback
+  int feedback_slot;               // Slot to send feedback
+  bool feedback_sent;              // Has feedback been sent?
+} nr_gf_harq_feedback_t;
+
 uint8_t nr_get_rv(int rel_round);
 
 /*! \brief NR_list_t is a "list" (of users, HARQ processes, slices, ...).
@@ -696,6 +885,14 @@ typedef struct {
   // pdcch closed loop adjust for PDCCH aggregation level, range <0, 1>
   // 0 - good channel, 1 - bad channel
   float pdcch_cl_adjust;
+
+  // Grant-Free scheduling
+  bool gf_configured;           // UE has GF configured
+  uint8_t gf_config_index;      // Index into gf_manager.ue_configs
+  bool gf_expected_this_slot;   // GF expected in current slot
+  
+  // GF HARQ tracking
+  nr_gf_harq_feedback_t gf_harq_feedback;  // Pending HARQ feedback
 } NR_UE_sched_ctrl_t;
 
 typedef struct NR_mac_dir_stats {
@@ -986,6 +1183,9 @@ typedef struct gNB_MAC_INST_s {
 
   mac_stats_t mac_stats;
   uint64_t num_scheduled_prach_rx;
+
+  // Grant-Free manager
+  nr_gf_gnb_manager_t gf_manager;
 
 
 } gNB_MAC_INST;

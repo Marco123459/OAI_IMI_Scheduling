@@ -247,6 +247,11 @@ void gNB_dlsch_ulsch_scheduler(module_id_t module_idP, frame_t frame, slot_t slo
   }
 
   start_meas(&gNB->schedule_ulsch);
+
+  // Check for GF occasions and schedule reception
+  if (gNB->gf_manager.gf_enabled) {
+    nr_gf_gnb_slot_process(gNB, frameP, slotP);
+  }
   
   nr_schedule_ulsch(module_idP, frame, slot, &sched_info->UL_dci_req);
 
