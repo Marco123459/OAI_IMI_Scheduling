@@ -2954,6 +2954,18 @@ int nr_ue_configure_grant_free(NR_UE_MAC_INST_t *mac, nr_gf_config_t *gf_params)
   gf->tx_empty = 0;
   gf->harq_nack_count = 0;
   gf->harq_dtx_count = 0;
+
+  // Phase 2 fields
+  gf->max_retransmissions = 4;  // Default: 4 retransmissions
+  gf->current_rv_index = 0;
+  gf->successful_tx_count = 0;
+  gf->failed_tx_count = 0;
+  gf->total_bytes_transmitted = 0;
+  gf->total_bsr_sent = 0;
+  gf->last_tx_frame = 0;
+  gf->last_tx_slot = 0;
+  gf->no_data_behavior = GF_NO_DATA_SKIP;  // Default: skip if no data
+  gf->include_bsr_always = false;
   
   // Increment config counter
   mac->num_gf_configs++;

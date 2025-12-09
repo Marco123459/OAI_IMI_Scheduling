@@ -302,6 +302,28 @@ typedef struct nr_gf_config {
   uint32_t tx_empty;           // Transmissions with no data (empty or BSR only)
   uint32_t harq_nack_count;    // Number of NACKs received
   uint32_t harq_dtx_count;     // Number of DTX (no feedback)
+
+  // Transmission History
+  frame_t last_tx_frame;
+  int last_tx_slot;
+  
+  // HARQ Management 
+  uint8_t max_retransmissions;      // Maximum HARQ retransmissions (1-8)
+  uint8_t current_rv_index;         // Current position in rv_sequence
+  
+  // Extended Statistics 
+  uint32_t successful_tx_count;     // Transmissions with ACK
+  uint32_t failed_tx_count;         // Transmissions that failed after max retx
+  uint32_t total_bytes_transmitted; // Total bytes sent successfully
+  uint32_t total_bsr_sent;          // Number of BSRs included in GF
+  
+  // Data Tracking 
+  uint32_t last_tbs;                // TBS of last transmission
+  uint8_t last_mcs_used;            // MCS of last transmission
+  
+  // Behavior Configuration 
+  uint8_t no_data_behavior;         // What to do when no data: 0=skip, 1=send_bsr, 2=padding
+  bool include_bsr_always;          // Always include BSR even if not triggered
   
 } nr_gf_config_t;
 
@@ -540,8 +562,13 @@ typedef struct {
 typedef struct {
   uint32_t R;
   uint32_t TBS;
-  int last_ndi;
+  int last_ndi; //ndi
   int round;
+
+  // Add for GF suport, need to be checked!!
+  uint8_t *tx_buffer;        // Pointer to MAC PDU for retransmission
+  uint32_t tx_buffer_size;   // Size of stored MAC PDU
+  bool is_grant_free;        // True if this HARQ process is used for GF
 } NR_UE_UL_HARQ_INFO_t;
 
 typedef struct {
@@ -808,6 +835,10 @@ typedef struct NR_UE_MAC_INST_s {
   nr_gf_config_t gf_config[NR_MAX_GF_CONFIGS];  // Array of GF configurations
   uint8_t num_gf_configs;                        // Number of active GF configs
   bool gf_enabled;                               // Global GF enable flag
+
+  //nr_gf_statistics_t gf_stats;                   // Global GF statistics
+  
+  frame_t frame;                                 // Current frame (for RLC callbacks)
 
 } NR_UE_MAC_INST_t;
 

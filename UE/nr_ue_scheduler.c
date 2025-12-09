@@ -50,6 +50,18 @@
 #include "openair2/LAYER2/nr_rlc/nr_rlc_oai_api.h"
 #include "RRC/NR_UE/L2_interface_ue.h"
 
+#include "common/utils/LOG/log.h"
+#include "NR_MAC_UE/mac_defs.h"
+
+// What to do when there's no data at GF occasion
+typedef enum {
+  GF_NO_DATA_SKIP,        // Don't transmit anything (save power)
+  GF_NO_DATA_SEND_BSR,    // Send BSR only (0 bytes to report)
+  GF_NO_DATA_SEND_PADDING // Send padding (keep gNB synchronized)
+} gf_no_data_behavior_t;
+
+// Default behavior - can be configured
+#define GF_NO_DATA_DEFAULT_BEHAVIOR  GF_NO_DATA_SKIP
 
 //#define SRS_DEBUG
 #define verifyMutex(a)                                                \
@@ -338,6 +350,261 @@ fapi_nr_ul_config_request_pdu_t *lockGet_ul_iterator(NR_UE_MAC_INST_t *mac, fram
   }
   AssertFatal(mac->ul_config_request != NULL, "mac->ul_config_request not initialized, logic bug\n");
   return fapiLockIterator(mac->ul_config_request + slot_tx, frame_tx, slot_tx);
+}
+
+/* ============================================================================
+ * FUNCTION: nr_ue_gf_check_pending_data
+ * 
+ * Check if there's data available for transmission on Grant-Free resources.
+ * Returns the total amount of pending data across all logical channels.
+ * ============================================================================
+ */
+static uint32_t nr_ue_gf_check_pending_data(NR_UE_MAC_INST_t *mac)
+{
+  uint32_t total_pending = 0;
+  
+  // Iterate through all logical channels and sum pending data
+  for (int idx = 0; idx < mac->lc_ordered_list.count; idx++) {
+    nr_lcordered_info_t *lc_info = mac->lc_ordered_list.array[idx];
+    NR_LC_SCHEDULING_INFO *lc_sched_info = get_scheduling_info_from_lcid(mac, lc_info->lcid);
+    
+    if (lc_sched_info && lc_sched_info->LCID_buffer_remain > 0) {
+      total_pending += lc_sched_info->LCID_buffer_remain;
+      LOG_D(NR_MAC, "[GF] LCID %d has %d bytes pending\n", 
+            lc_info->lcid, lc_sched_info->LCID_buffer_remain);
+    }
+  }
+  
+  return total_pending;
+}
+
+
+/* ============================================================================
+ * FUNCTION: nr_ue_gf_get_bsr_len
+ * 
+ * Calculate the length of BSR to include in MAC PDU.
+ * Returns 0 if no BSR needed, otherwise returns BSR MAC CE length.
+ * ============================================================================
+ */
+static uint8_t nr_ue_gf_get_bsr_len(NR_UE_MAC_INST_t *mac, 
+                                     NR_BSR_SHORT *short_bsr,
+                                     NR_BSR_LONG *long_bsr,
+                                     bool *is_long_bsr)
+{
+  NR_UE_SCHEDULING_INFO *sched_info = &mac->scheduling_info;
+  
+  *is_long_bsr = false;
+  
+  // Check if BSR is triggered
+  if (!sched_info->BSR_reporting_active) {
+    return 0;
+  }
+  
+  // Count how many LCGs have data
+  int lcg_count = 0;
+  int single_lcg_id = -1;
+  
+  for (int lcg = 0; lcg < NR_MAX_NUM_LCGID; lcg++) {
+    if (sched_info->BSR_bytes[lcg] > 0) {
+      lcg_count++;
+      single_lcg_id = lcg;
+    }
+  }
+  
+  if (lcg_count == 0) {
+    // No data to report
+    return 0;
+  } else if (lcg_count == 1) {
+    // Short BSR: 1 byte (LCG ID + Buffer Size Index)
+    short_bsr->LcgID = single_lcg_id;
+    short_bsr->Buffer_size = nr_get_bsr_index(sched_info->BSR_bytes[single_lcg_id]);
+    *is_long_bsr = false;
+    return 1;  // Short BSR is 1 byte
+  } else {
+    // Long BSR: 1 byte LCG bitmap + N bytes buffer sizes
+    long_bsr->LcgID_bitmap = 0;
+    int bsr_idx = 0;
+    for (int lcg = 0; lcg < NR_MAX_NUM_LCGID; lcg++) {
+      if (sched_info->BSR_bytes[lcg] > 0) {
+        long_bsr->LcgID_bitmap |= (1 << lcg);
+        long_bsr->Buffer_size[bsr_idx++] = nr_get_bsr_index(sched_info->BSR_bytes[lcg]);
+      }
+    }
+    *is_long_bsr = true;
+    return 1 + lcg_count;  // 1 byte bitmap + lcg_count buffer size bytes
+  }
+}
+
+
+/* ============================================================================
+ * FUNCTION: nr_ue_gf_build_mac_pdu
+ * 
+ * Build the MAC PDU for Grant-Free transmission.
+ * This function:
+ * 1. Adds BSR if triggered
+ * 2. Fills remaining space with SDUs from RLC
+ * 3. Adds padding if necessary
+ * 
+ * Parameters:
+ *   mac       - MAC instance
+ *   gf        - Grant-Free configuration
+ *   pdu       - Buffer to write MAC PDU
+ *   pdu_size  - Available space (TBS)
+ *   
+ * Returns: Actual bytes written to PDU
+ * ============================================================================
+ */
+static int nr_ue_gf_build_mac_pdu(NR_UE_MAC_INST_t *mac,
+                                   nr_gf_config_t *gf,
+                                   uint8_t *pdu,
+                                   uint32_t pdu_size)
+{
+  int offset = 0;
+  NR_UE_SCHEDULING_INFO *sched_info = &mac->scheduling_info;
+  
+  LOG_D(NR_MAC, "[GF] Building MAC PDU, TBS=%d bytes\n", pdu_size);
+  
+  // ========== STEP 1: Add BSR if triggered ==========
+  NR_BSR_SHORT short_bsr = {0};
+  NR_BSR_LONG long_bsr = {0};
+  bool is_long_bsr = false;
+  uint8_t bsr_len = nr_ue_gf_get_bsr_len(mac, &short_bsr, &long_bsr, &is_long_bsr);
+  
+  if (bsr_len > 0 && (offset + 1 + bsr_len) <= pdu_size) {
+    // Add BSR subheader
+    if (is_long_bsr) {
+      // Long BSR: LCID = 62 (LONG_BSR)
+      pdu[offset++] = (0 << 7) | (0 << 6) | UL_SCH_LCID_LONG_BSR;
+      // LCG bitmap
+      pdu[offset++] = long_bsr.LcgID_bitmap;
+      // Buffer sizes
+      for (int i = 0; i < 8; i++) {
+        if (long_bsr.LcgID_bitmap & (1 << i)) {
+          pdu[offset++] = long_bsr.Buffer_size[i];
+        }
+      }
+      LOG_I(NR_MAC, "[GF] Added Long BSR, bitmap=0x%02x\n", long_bsr.LcgID_bitmap);
+    } else {
+      // Short BSR: LCID = 61 (SHORT_BSR)
+      pdu[offset++] = (0 << 7) | (0 << 6) | UL_SCH_LCID_SHORT_BSR;
+      pdu[offset++] = (short_bsr.LcgID << 5) | (short_bsr.Buffer_size & 0x1F);
+      LOG_I(NR_MAC, "[GF] Added Short BSR, LCG=%d, BS=%d\n", 
+            short_bsr.LcgID, short_bsr.Buffer_size);
+    }
+    
+    // Clear BSR trigger after inclusion
+    sched_info->BSR_reporting_active = BSR_NOT_TRIGGERED;
+  }
+  
+  // ========== STEP 2: Add SDUs from RLC ==========
+  // Process logical channels in priority order
+  for (int idx = 0; idx < mac->lc_ordered_list.count && offset < pdu_size; idx++) {
+    nr_lcordered_info_t *lc_info = mac->lc_ordered_list.array[idx];
+    int lcid = lc_info->lcid;
+    
+    NR_LC_SCHEDULING_INFO *lc_sched_info = get_scheduling_info_from_lcid(mac, lcid);
+    if (!lc_sched_info || lc_sched_info->LCID_buffer_remain == 0) {
+      continue;  // No data for this LC
+    }
+    
+    // Calculate space available for this SDU
+    // Need at least 2 bytes for subheader (R/F/LCID + L) + 1 byte data
+    int remaining_space = pdu_size - offset;
+    if (remaining_space < 3) {
+      break;  // Not enough space for any SDU
+    }
+    
+    // Determine subheader size (1 byte LCID + 1 or 2 bytes length)
+    int subheader_size;
+    int max_sdu_size;
+    
+    if (remaining_space - 2 <= 255) {
+      // 8-bit length field (F=0)
+      subheader_size = 2;
+      max_sdu_size = remaining_space - subheader_size;
+    } else {
+      // 16-bit length field (F=1)
+      subheader_size = 3;
+      max_sdu_size = remaining_space - subheader_size;
+    }
+    
+    // Limit to what RLC has
+    int sdu_size = (lc_sched_info->LCID_buffer_remain < max_sdu_size) ?
+                    lc_sched_info->LCID_buffer_remain : max_sdu_size;
+    
+    if (sdu_size <= 0) {
+      continue;
+    }
+
+    uint16_t sdu_length = nr_mac_rlc_data_req(mac->ue_id,
+                                            mac->ue_id,
+                                            false,
+                                            lcid,
+                                            bytes_requested,
+                                            (char *)mac_ce_p->cur_ptr + header_sz);
+
+    
+    // Request SDU from RLC
+    // Note: mac_rlc_data_req returns actual bytes copied
+    // To be checked!!
+    tbs_size_t bytes_read = mac_rlc_data_req(mac->ue_id,
+                                              mac->ue_id,  // module_id
+                                              false,           // gNB_index
+                                              mac->frame,
+                                              ENB_FLAG_NO,
+                                              MBMS_FLAG_NO,
+                                              lcid,
+                                              sdu_size,
+                                              &pdu[offset + subheader_size],
+                                              0,           // eNB_id (not used)
+                                              0);          // sourceL2Id (not used)
+    
+    if (bytes_read > 0) {
+      // Write subheader
+      if (bytes_read <= 255) {
+        // Short length (F=0)
+        pdu[offset++] = (0 << 7) | (0 << 6) | (lcid & 0x3F);  // R=0, F=0, LCID
+        pdu[offset++] = bytes_read & 0xFF;                    // L (8 bits)
+      } else {
+        // Long length (F=1)
+        pdu[offset++] = (0 << 7) | (1 << 6) | (lcid & 0x3F);  // R=0, F=1, LCID
+        pdu[offset++] = (bytes_read >> 8) & 0xFF;             // L (high byte)
+        pdu[offset++] = bytes_read & 0xFF;                    // L (low byte)
+      }
+      
+      offset += bytes_read;  // Skip over SDU data
+      
+      // Update buffer tracking
+      lc_sched_info->LCID_buffer_remain -= bytes_read;
+      
+      LOG_I(NR_MAC, "[GF] Added SDU: LCID=%d, size=%d bytes, remaining=%d\n",
+            lcid, bytes_read, lc_sched_info->LCID_buffer_remain);
+    }
+  }
+  
+  // ========== STEP 3: Add padding if needed ==========
+  if (offset < pdu_size) {
+    int padding_len = pdu_size - offset;
+    
+    if (padding_len == 1) {
+      // Single byte padding: just LCID
+      pdu[offset++] = UL_SCH_LCID_PADDING;
+    } else if (padding_len == 2) {
+      // Two byte padding: LCID + LCID (two padding LCIDs)
+      pdu[offset++] = UL_SCH_LCID_PADDING;
+      pdu[offset++] = UL_SCH_LCID_PADDING;
+    } else {
+      // Multi-byte padding: subheader + padding bytes
+      // Use padding LCID without length (fills rest of PDU)
+      pdu[offset++] = UL_SCH_LCID_PADDING;
+      memset(&pdu[offset], 0, padding_len - 1);
+      offset = pdu_size;
+    }
+    
+    LOG_D(NR_MAC, "[GF] Added %d bytes padding\n", padding_len);
+  }
+  
+  return offset;
 }
 
 /**
@@ -649,68 +916,279 @@ int nr_config_pusch_pdu_grant_free(NR_UE_MAC_INST_t *mac,
  */
 void nr_ue_schedule_grant_free(NR_UE_MAC_INST_t *mac, frame_t frame, int slot)
 {
-  // Check if this is a GF occasion
+  // ========== STEP 1: Check if this is a GF occasion ==========
   nr_gf_config_t *gf = nr_ue_check_grant_free_occasion(mac, frame, slot);
-  if (!gf) {
+  
+  if (gf == NULL) {
     return;  // Not a GF occasion
   }
   
-  /* ========== Phase 2+: Check for Data ========== */
-  /*
-   * In later phases, we'll check if there's actually data to transmit:
-   * 
-   * bool has_data = false;
-   * for (int i = 0; i < mac->lc_ordered_list.count; i++) {
-   *   nr_lcordered_info_t *lc_info = mac->lc_ordered_list.array[i];
-   *   NR_LC_SCHEDULING_INFO *lc_sched_info = get_scheduling_info_from_lcid(mac, lc_info->lcid);
-   *   if (lc_sched_info->LCID_buffer_remain > 0) {
-   *     has_data = true;
-   *     break;
-   *   }
-   * }
-   * 
-   * if (!has_data) {
-   *   LOG_D(NR_MAC, "[UE %d] GF occasion at %d.%d but no data\n", mac->ue_id, frame, slot);
-   *   gf->tx_empty++;
-   *   return;  // Or send empty BSR
-   * }
-   */
+  LOG_I(NR_MAC, "[UE %d] GF occasion detected at frame %d slot %d (config %d)\n",
+        mac->ue_id, frame, slot, gf - mac->gf_config);
   
-  /* ========== Allocate UL Config PDU ========== */
+  // ========== STEP 2: Check for pending data ==========
+  uint32_t pending_data = nr_ue_gf_check_pending_data(mac);
+  bool bsr_triggered = (mac->scheduling_info.BSR_reporting_active != BSR_NOT_TRIGGERED);
   
-  fapi_nr_ul_config_request_pdu_t *pdu = lockGet_ul_config(mac, frame, slot, 
-                                                           FAPI_NR_UL_CONFIG_TYPE_PUSCH);
+  LOG_D(NR_MAC, "[GF] Pending data: %d bytes, BSR triggered: %s\n",
+        pending_data, bsr_triggered ? "yes" : "no");
+  
+  // Decide whether to transmit based on configuration
+  gf_no_data_behavior_t no_data_behavior = GF_NO_DATA_DEFAULT_BEHAVIOR;
+  
+  if (pending_data == 0 && !bsr_triggered) {
+    switch (no_data_behavior) {
+      case GF_NO_DATA_SKIP:
+        LOG_D(NR_MAC, "[GF] No data and no BSR - skipping GF transmission\n");
+        return;
+        
+      case GF_NO_DATA_SEND_BSR:
+        LOG_D(NR_MAC, "[GF] No data - will send empty BSR\n");
+        break;
+        
+      case GF_NO_DATA_SEND_PADDING:
+        LOG_D(NR_MAC, "[GF] No data - will send padding\n");
+        break;
+    }
+  }
+  
+  // ========== STEP 3: Get ul_config and allocate PDU ==========
+  fapi_nr_ul_config_request_pdu_t *pdu = lockGet_ul_config(mac, frame, slot, FAPI_NR_UL_CONFIG_TYPE_PUSCH);
+  
   if (!pdu) {
-    LOG_E(NR_MAC, "[UE %d] Failed to allocate UL config PDU for GF at %d.%d\n",
-          mac->ue_id, frame, slot);
+    LOG_E(NR_MAC, "[GF] Failed to allocate ul_config PDU\n");
     return;
   }
   
-  /* ========== Configure PUSCH PDU ========== */
+  // ========== STEP 4: Configure PUSCH PDU ==========
+  nfapi_nr_ue_pusch_pdu_t *pusch_pdu = &pdu->pusch_config_pdu;
   
-  int ret = nr_config_pusch_pdu_grant_free(mac, gf, &pdu->pusch_config_pdu, frame, slot);
-  if (ret != 0) {
-    LOG_E(NR_MAC, "[UE %d] Failed to configure GF PUSCH PDU at %d.%d\n",
-          mac->ue_id, frame, slot);
-    remove_ul_config_last_item(pdu);
+  int ret = nr_config_pusch_pdu_grant_free(mac, gf, pusch_pdu, frame, slot);
+  
+  if (ret < 0) {
+    LOG_E(NR_MAC, "[GF] Failed to configure PUSCH PDU\n");
     release_ul_config(pdu, false);
     return;
   }
   
-  /* ========== Release Lock ========== */
+  uint32_t TBS = pusch_pdu->pusch_data.tb_size;
   
-  release_ul_config(pdu, false);
+  if (TBS == 0) {
+    LOG_E(NR_MAC, "[GF] TBS is 0 - cannot transmit\n");
+    release_ul_config(pdu, false);
+    return;
+  }
   
-  /* ========== Update Statistics ========== */
+  // ========== STEP 5: Allocate MAC PDU buffer ==========
+  uint8_t *mac_pdu = (uint8_t *)malloc(TBS);
+  
+  if (!mac_pdu) {
+    LOG_E(NR_MAC, "[GF] Failed to allocate MAC PDU buffer (%d bytes)\n", TBS);
+    release_ul_config(pdu, false);
+    return;
+  }
+  
+  memset(mac_pdu, 0, TBS);
+  
+  // ========== STEP 6: Build MAC PDU ==========
+  // Store frame for RLC callback
+  mac->frame = frame;
+  
+  int pdu_len = nr_ue_gf_build_mac_pdu(mac, gf, mac_pdu, TBS);
+  
+  if (pdu_len <= 0) {
+    LOG_W(NR_MAC, "[GF] MAC PDU build returned %d bytes\n", pdu_len);
+    // Still transmit with padding if configured to do so
+    memset(mac_pdu, 0, TBS);
+    mac_pdu[0] = UL_SCH_LCID_PADDING;  // Padding LCID
+    pdu_len = TBS;
+  }
+  
+  // ========== STEP 7: Attach MAC PDU to PUSCH ==========
+  // The MAC PDU pointer needs to be passed to the PHY layer
+  // In OAI, this is done through the ulsch structure
+  
+  // Store MAC PDU pointer in the PUSCH config for PHY
+  pusch_pdu->pusch_data.harq_process_id = gf->harq_process_id;
+  
+  // Note: The actual mechanism to pass MAC PDU to PHY varies by OAI version
+  // In newer versions, it might be through shared memory or a callback
+  // For now, we store it in a location the PHY can access
+  
+  // Update HARQ buffer with MAC PDU
+  NR_UE_UL_HARQ_INFO_t *harq = &mac->ul_harq_info[gf->harq_process_id];
+  
+  // If there's an existing buffer, check if it's a retransmission
+  if (harq->round == 0 || gf->ndi_toggle != harq->ndi) {
+    // New transmission
+    if (harq->tx_buffer) {
+      free(harq->tx_buffer);
+    }
+    harq->tx_buffer = mac_pdu;
+    harq->tx_buffer_size = TBS;
+    harq->ndi = gf->ndi_toggle;
+    harq->round = 0;
+    
+    LOG_I(NR_MAC, "[GF] New transmission: HARQ pid=%d, NDI=%d, TBS=%d\n",
+          gf->harq_process_id, harq->ndi, TBS);
+  } else {
+    // Retransmission - use existing buffer
+    free(mac_pdu);  // Don't need new PDU
+    
+    LOG_I(NR_MAC, "[GF] Retransmission: HARQ pid=%d, round=%d, RV=%d\n",
+          gf->harq_process_id, harq->round, gf->rv_sequence[harq->round % 4]);
+  }
+  
+  // Set RV based on retransmission round
+  pusch_pdu->pusch_data.rv_index = gf->rv_sequence[harq->round % 4];
+  pusch_pdu->pusch_data.new_data_indicator = gf->ndi_toggle;
+  
+  // ========== STEP 8: Release ul_config and update stats ==========
+  release_ul_config(pdu, true);  // true = PDU is valid, will be processed
   
   gf->tx_count++;
+  gf->last_tx_frame = frame;
+  gf->last_tx_slot = slot;
   
-  LOG_I(NR_MAC, "[UE %d] GF PUSCH scheduled at %d.%d (total tx: %d)\n",
-        mac->ue_id, frame, slot, gf->tx_count);
+  LOG_I(NR_MAC, "[UE %d] GF PUSCH scheduled at %d.%d:\n"
+        "        TBS=%d bytes, data=%d bytes, HARQ pid=%d, RV=%d\n"
+        "        Total GF transmissions: %d\n",
+        mac->ue_id, frame, slot,
+        TBS, pdu_len, gf->harq_process_id, 
+        pusch_pdu->pusch_data.rv_index,
+        gf->tx_count);
 }
 
 
+/* ============================================================================
+ * FUNCTION: nr_ue_gf_process_harq_feedback
+ * 
+ * Process HARQ feedback for Grant-Free transmissions.
+ * Called when HARQ ACK/NACK is received from gNB.
+ * ============================================================================
+ */
+void nr_ue_gf_process_harq_feedback(NR_UE_MAC_INST_t *mac,
+                                     int harq_pid,
+                                     bool ack)
+{
+  // Find GF config using this HARQ process
+  nr_gf_config_t *gf = NULL;
+  
+  for (int i = 0; i < mac->num_gf_configs; i++) {
+    if (mac->gf_config[i].enabled && 
+        mac->gf_config[i].harq_process_id == harq_pid) {
+      gf = &mac->gf_config[i];
+      break;
+    }
+  }
+  
+  if (!gf) {
+    // Not a GF HARQ process - handle normally
+    return;
+  }
+  
+  NR_UE_UL_HARQ_INFO_t *harq = &mac->ul_harq_info[harq_pid];
+  
+  if (ack) {
+    // ACK received - transmission successful
+    LOG_I(NR_MAC, "[GF] HARQ ACK received for pid=%d, round=%d\n",
+          harq_pid, harq->round);
+    
+    // Toggle NDI for next transmission
+    gf->ndi_toggle = !gf->ndi_toggle;
+    
+    // Reset round counter
+    harq->round = 0;
+    
+    // Free TX buffer
+    if (harq->tx_buffer) {
+      free(harq->tx_buffer);
+      harq->tx_buffer = NULL;
+      harq->tx_buffer_size = 0;
+    }
+    
+    // Update stats
+    gf->successful_tx_count++;
+    
+  } else {
+    // NACK received - need retransmission
+    harq->round++;
+    
+    LOG_I(NR_MAC, "[GF] HARQ NACK received for pid=%d, round now=%d\n",
+          harq_pid, harq->round);
+    
+    // Check max retransmissions
+    if (harq->round >= gf->max_retransmissions) {
+      LOG_W(NR_MAC, "[GF] Max retransmissions (%d) reached for pid=%d\n",
+            gf->max_retransmissions, harq_pid);
+      
+      // Toggle NDI to signal new transmission
+      gf->ndi_toggle = !gf->ndi_toggle;
+      harq->round = 0;
+      
+      // Free TX buffer - data is lost
+      if (harq->tx_buffer) {
+        free(harq->tx_buffer);
+        harq->tx_buffer = NULL;
+        harq->tx_buffer_size = 0;
+      }
+      
+      // Update stats
+      gf->harq_nack_count++;
+      gf->failed_tx_count++;
+    } else {
+      // Schedule retransmission on next GF occasion
+      // The existing buffer will be reused with different RV
+      gf->harq_nack_count++;
+    }
+  }
+}
 
+
+/* ============================================================================
+ * FUNCTION: nr_ue_gf_handle_dtx
+ * 
+ * Handle DTX (no HARQ feedback received) for Grant-Free.
+ * This might happen if gNB didn't decode the transmission at all.
+ * ============================================================================
+ */
+void nr_ue_gf_handle_dtx(NR_UE_MAC_INST_t *mac, int harq_pid)
+{
+  nr_gf_config_t *gf = NULL;
+  
+  for (int i = 0; i < mac->num_gf_configs; i++) {
+    if (mac->gf_config[i].enabled && 
+        mac->gf_config[i].harq_process_id == harq_pid) {
+      gf = &mac->gf_config[i];
+      break;
+    }
+  }
+  
+  if (!gf) {
+    return;
+  }
+  
+  NR_UE_UL_HARQ_INFO_t *harq = &mac->ul_harq_info[harq_pid];
+  
+  LOG_W(NR_MAC, "[GF] DTX detected for pid=%d (no HARQ feedback)\n", harq_pid);
+  
+  // Treat DTX as NACK
+  harq->round++;
+  gf->harq_dtx_count++;
+  
+  if (harq->round >= gf->max_retransmissions) {
+    LOG_E(NR_MAC, "[GF] Max retransmissions after DTX for pid=%d\n", harq_pid);
+    gf->ndi_toggle = !gf->ndi_toggle;
+    harq->round = 0;
+    
+    if (harq->tx_buffer) {
+      free(harq->tx_buffer);
+      harq->tx_buffer = NULL;
+    }
+    
+    gf->failed_tx_count++;
+  }
+}
 
 /*
  * This function returns the DL config corresponding to a given DL slot

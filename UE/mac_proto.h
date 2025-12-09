@@ -401,5 +401,17 @@ int nr_ue_get_grant_free_stats(NR_UE_MAC_INST_t *mac,
                                 uint8_t config_index,
                                 nr_gf_stats_t *stats);
 
+// HARQ handling
+void nr_ue_gf_process_harq_feedback(NR_UE_MAC_INST_t *mac, int harq_pid, bool ack);
+void nr_ue_gf_handle_dtx(NR_UE_MAC_INST_t *mac, int harq_pid);
+
+// Data handling
+uint32_t nr_ue_gf_check_pending_data(NR_UE_MAC_INST_t *mac);
+int nr_ue_gf_build_mac_pdu(NR_UE_MAC_INST_t *mac, nr_gf_config_t *gf,
+                           uint8_t *pdu, uint32_t pdu_size);
+
+// Statistics
+void nr_ue_gf_get_statistics(NR_UE_MAC_INST_t *mac, nr_gf_statistics_t *stats);
+void nr_ue_gf_reset_statistics(NR_UE_MAC_INST_t *mac);
 
 #endif
