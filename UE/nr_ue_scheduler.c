@@ -362,6 +362,7 @@ nr_gf_config_t* nr_ue_check_grant_free_occasion(NR_UE_MAC_INST_t *mac,
 {
   // Early exit if GF not enabled globally
   if (!mac->gf_enabled || mac->num_gf_configs == 0) {
+    LOG_I(NR_MAC, "[GF][UE %d] Grant-Free not enabled or no configurations\n", mac->ue_id);
     return NULL;
   }
   
@@ -391,6 +392,8 @@ nr_gf_config_t* nr_ue_check_grant_free_occasion(NR_UE_MAC_INST_t *mac,
     // Handle negative offset by adding periodicity
     int slot_diff = absolute_slot - gf->offset;
     if (slot_diff < 0) {
+      LOG_I(NR_MAC, "[GF][UE %d] GF config offset not yet reached in slot\n",
+            mac->ue_id);
       // Not yet reached the first occasion
       continue;
     }
@@ -1774,18 +1777,18 @@ void nr_ue_ul_scheduler(NR_UE_MAC_INST_t *mac, nr_uplink_indication_t *ul_info)
   if (mac->state == UE_PERFORMING_RA && ra->ra_state == nrRA_GENERATE_PREAMBLE)
     nr_ue_prach_scheduler(mac, frame_tx, slot_tx);
 
-    bool BSRsent = false;
-    if (mac->state == UE_CONNECTED) {
+  bool BSRsent = false;
+  if (mac->state == UE_CONNECTED) {
     // ========== GRANT-FREE SCHEDULING ==========
     // Check and schedule Grant-Free transmission before dynamic grants
     // GF has priority over dynamic scheduling
-      if (mac->gf_enabled && mac->num_gf_configs > 0) {
-        nr_ue_schedule_grant_free(mac, frame_tx, slot_tx);
-      }
+    if (mac->gf_enabled && mac->num_gf_configs > 0) {
+      nr_ue_schedule_grant_free(mac, frame_tx, slot_tx);
+    }
     // ========== END GRANT-FREE ==========
-      
-      nr_ue_periodic_srs_scheduling(mac, frame_tx, slot_tx);
-      nr_update_rlc_buffers_status(mac, frame_tx, slot_tx, gNB_index);
+    
+    nr_ue_periodic_srs_scheduling(mac, frame_tx, slot_tx);
+    nr_update_rlc_buffers_status(mac, frame_tx, slot_tx, gNB_index);
   }
 
   // Schedule ULSCH only if the current frame and slot match those in ul_config_req

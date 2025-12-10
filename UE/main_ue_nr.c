@@ -90,7 +90,7 @@ void nr_ue_init_mac(NR_UE_MAC_INST_t *mac)
   mac->pusch_power_control_initialized = false;
 
   // ========== Grant-Free Initialization ==========
-  mac->gf_enabled = false;
+  mac->gf_enabled = true;
   mac->num_gf_configs = 0;
   memset(mac->gf_config, 0, sizeof(mac->gf_config));
   // ========== End Grant-Free Init ==========

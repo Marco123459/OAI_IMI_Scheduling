@@ -1173,6 +1173,8 @@ void nr_ra_succeeded(NR_UE_MAC_INST_t *mac, const uint8_t gNB_index, const frame
   mac->state = UE_CONNECTED;
   free_and_zero(ra->Msg3_buffer);
   nr_mac_rrc_ra_ind(mac->ue_id, true);
+  nr_ue_init_default_grant_free(mac);
+  LOG_I(NR_MAC, "[UE %d] Grant-Free initialized after RA success\n", mac->ue_id);
 }
 
 void nr_ra_backoff_setting(RA_config_t *ra)
