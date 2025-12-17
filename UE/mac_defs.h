@@ -327,7 +327,12 @@ typedef struct nr_gf_config {
   
 } nr_gf_config_t;
 
-
+// Grant-Free no-data behavior
+typedef enum {
+  GF_NO_DATA_SKIP = 0,        // Don't transmit if no data (default)
+  GF_NO_DATA_SEND_BSR = 1,    // Send BSR only
+  GF_NO_DATA_SEND_PADDING = 2 // Send padding
+} gf_no_data_behavior_t;
 
 
 
@@ -724,6 +729,32 @@ typedef struct ntn_timing_advance_components {
   bool ntn_params_changed;
 } ntn_timing_advance_componets_t;
 
+typedef struct {
+  // Counters
+  uint64_t total_occasions;        // Total GF occasions since start
+  uint64_t occasions_with_data;    // Occasions where data was transmitted
+  uint64_t occasions_skipped;      // Occasions skipped (no data, skip behavior)
+  
+  // Throughput
+  uint64_t total_bytes_sent;       // Total bytes transmitted
+  uint64_t total_tbs_allocated;    // Total TBS across all transmissions
+  
+  // HARQ Statistics
+  uint32_t acks_received;
+  uint32_t nacks_received;
+  uint32_t dtx_detected;
+  uint32_t retransmissions;
+  
+  // Timing
+  uint64_t first_tx_timestamp;     // Timestamp of first GF transmission
+  uint64_t last_tx_timestamp;      // Timestamp of last GF transmission
+  
+  // Efficiency Metrics
+  float avg_utilization;           // avg(bytes_sent / tbs)
+  float success_rate;              // acks / (acks + failed)
+  
+} nr_gf_statistics_t;
+
 /*!\brief Top level UE MAC structure */
 typedef struct NR_UE_MAC_INST_s {
   module_id_t ue_id;
@@ -836,7 +867,7 @@ typedef struct NR_UE_MAC_INST_s {
   uint8_t num_gf_configs;                        // Number of active GF configs
   bool gf_enabled;                               // Global GF enable flag
 
-  //nr_gf_statistics_t gf_stats;                   // Global GF statistics
+  nr_gf_statistics_t gf_stats;                   // Global GF statistics
   
   frame_t frame;                                 // Current frame (for RLC callbacks)
 

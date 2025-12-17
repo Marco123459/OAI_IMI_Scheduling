@@ -53,16 +53,6 @@
 #include "common/utils/LOG/log.h"
 #include "NR_MAC_UE/mac_defs.h"
 
-// What to do when there's no data at GF occasion
-typedef enum {
-  GF_NO_DATA_SKIP,        // Don't transmit anything (save power)
-  GF_NO_DATA_SEND_BSR,    // Send BSR only (0 bytes to report)
-  GF_NO_DATA_SEND_PADDING // Send padding (keep gNB synchronized)
-} gf_no_data_behavior_t;
-
-// Default behavior - can be configured
-#define GF_NO_DATA_DEFAULT_BEHAVIOR  GF_NO_DATA_SKIP
-
 //#define SRS_DEBUG
 #define verifyMutex(a)                                                \
   {                                                                   \
@@ -359,7 +349,7 @@ fapi_nr_ul_config_request_pdu_t *lockGet_ul_iterator(NR_UE_MAC_INST_t *mac, fram
  * Returns the total amount of pending data across all logical channels.
  * ============================================================================
  */
-static uint32_t nr_ue_gf_check_pending_data(NR_UE_MAC_INST_t *mac)
+uint32_t nr_ue_gf_check_pending_data(NR_UE_MAC_INST_t *mac)
 {
   uint32_t total_pending = 0;
   
@@ -370,7 +360,7 @@ static uint32_t nr_ue_gf_check_pending_data(NR_UE_MAC_INST_t *mac)
     
     if (lc_sched_info && lc_sched_info->LCID_buffer_remain > 0) {
       total_pending += lc_sched_info->LCID_buffer_remain;
-      LOG_D(NR_MAC, "[GF] LCID %d has %d bytes pending\n", 
+      LOG_D(NR_MAC, "[GF] LCID %ld has %d bytes pending\n", 
             lc_info->lcid, lc_sched_info->LCID_buffer_remain);
     }
   }
@@ -386,6 +376,12 @@ static uint32_t nr_ue_gf_check_pending_data(NR_UE_MAC_INST_t *mac)
  * Returns 0 if no BSR needed, otherwise returns BSR MAC CE length.
  * ============================================================================
  */
+/**
+ * @brief Calculate BSR length and fill BSR structure for Grant-Free
+ * 
+ * This version uses Short BSR only, which is typical for Grant-Free.
+ * NR_BSR_SHORT has: Buffer_size (5 bits) + LcgID (3 bits) = 1 byte
+ */
 static uint8_t nr_ue_gf_get_bsr_len(NR_UE_MAC_INST_t *mac, 
                                      NR_BSR_SHORT *short_bsr,
                                      NR_BSR_LONG *long_bsr,
@@ -396,43 +392,27 @@ static uint8_t nr_ue_gf_get_bsr_len(NR_UE_MAC_INST_t *mac,
   *is_long_bsr = false;
   
   // Check if BSR is triggered
-  if (!sched_info->BSR_reporting_active) {
+  if (sched_info->BSR_reporting_active == NR_BSR_TRIGGER_NONE) {
     return 0;
   }
   
-  // Count how many LCGs have data
-  int lcg_count = 0;
-  int single_lcg_id = -1;
+  // Calculate total pending data
+  uint32_t total_pending = nr_ue_gf_check_pending_data(mac);
   
-  for (int lcg = 0; lcg < NR_MAX_NUM_LCGID; lcg++) {
-    if (sched_info->BSR_bytes[lcg] > 0) {
-      lcg_count++;
-      single_lcg_id = lcg;
-    }
-  }
-  
-  if (lcg_count == 0) {
-    // No data to report
+  if (total_pending == 0) {
     return 0;
-  } else if (lcg_count == 1) {
-    // Short BSR: 1 byte (LCG ID + Buffer Size Index)
-    short_bsr->LcgID = single_lcg_id;
-    short_bsr->Buffer_size = nr_get_bsr_index(sched_info->BSR_bytes[single_lcg_id]);
-    *is_long_bsr = false;
-    return 1;  // Short BSR is 1 byte
-  } else {
-    // Long BSR: 1 byte LCG bitmap + N bytes buffer sizes
-    long_bsr->LcgID_bitmap = 0;
-    int bsr_idx = 0;
-    for (int lcg = 0; lcg < NR_MAX_NUM_LCGID; lcg++) {
-      if (sched_info->BSR_bytes[lcg] > 0) {
-        long_bsr->LcgID_bitmap |= (1 << lcg);
-        long_bsr->Buffer_size[bsr_idx++] = nr_get_bsr_index(sched_info->BSR_bytes[lcg]);
-      }
-    }
-    *is_long_bsr = true;
-    return 1 + lcg_count;  // 1 byte bitmap + lcg_count buffer size bytes
   }
+  
+  // For Grant-Free, we use Short BSR with LCG 1 (default data LCG)
+  short_bsr->LcgID = 1;
+  short_bsr->Buffer_size = nr_locate_BsrIndexByBufferSize(NR_SHORT_BSR_TABLE_SIZE,
+                                                           total_pending);
+  *is_long_bsr = false;
+  
+  LOG_D(NR_MAC, "[GF] Short BSR: LCG %d, buffer %d bytes, index %d\n",
+        short_bsr->LcgID, total_pending, short_bsr->Buffer_size);
+  
+  return 1;  // Short BSR is 1 byte
 }
 
 
@@ -454,7 +434,7 @@ static uint8_t nr_ue_gf_get_bsr_len(NR_UE_MAC_INST_t *mac,
  * Returns: Actual bytes written to PDU
  * ============================================================================
  */
-static int nr_ue_gf_build_mac_pdu(NR_UE_MAC_INST_t *mac,
+int nr_ue_gf_build_mac_pdu(NR_UE_MAC_INST_t *mac,
                                    nr_gf_config_t *gf,
                                    uint8_t *pdu,
                                    uint32_t pdu_size)
@@ -471,29 +451,15 @@ static int nr_ue_gf_build_mac_pdu(NR_UE_MAC_INST_t *mac,
   uint8_t bsr_len = nr_ue_gf_get_bsr_len(mac, &short_bsr, &long_bsr, &is_long_bsr);
   
   if (bsr_len > 0 && (offset + 1 + bsr_len) <= pdu_size) {
-    // Add BSR subheader
-    if (is_long_bsr) {
-      // Long BSR: LCID = 62 (LONG_BSR)
-      pdu[offset++] = (0 << 7) | (0 << 6) | UL_SCH_LCID_LONG_BSR;
-      // LCG bitmap
-      pdu[offset++] = long_bsr.LcgID_bitmap;
-      // Buffer sizes
-      for (int i = 0; i < 8; i++) {
-        if (long_bsr.LcgID_bitmap & (1 << i)) {
-          pdu[offset++] = long_bsr.Buffer_size[i];
-        }
-      }
-      LOG_I(NR_MAC, "[GF] Added Long BSR, bitmap=0x%02x\n", long_bsr.LcgID_bitmap);
-    } else {
-      // Short BSR: LCID = 61 (SHORT_BSR)
-      pdu[offset++] = (0 << 7) | (0 << 6) | UL_SCH_LCID_SHORT_BSR;
-      pdu[offset++] = (short_bsr.LcgID << 5) | (short_bsr.Buffer_size & 0x1F);
-      LOG_I(NR_MAC, "[GF] Added Short BSR, LCG=%d, BS=%d\n", 
-            short_bsr.LcgID, short_bsr.Buffer_size);
-    }
+    // For Grant-Free, we only use Short BSR
+    // Short BSR: LCID = 0x3D (UL_SCH_LCID_S_BSR)
+    pdu[offset++] = (0 << 7) | (0 << 6) | UL_SCH_LCID_S_BSR;
+    pdu[offset++] = (short_bsr.LcgID << 5) | (short_bsr.Buffer_size & 0x1F);
+    LOG_I(NR_MAC, "[GF] Added Short BSR, LCG=%d, BS=%d\n", 
+          short_bsr.LcgID, short_bsr.Buffer_size);
     
     // Clear BSR trigger after inclusion
-    sched_info->BSR_reporting_active = BSR_NOT_TRIGGERED;
+    sched_info->BSR_reporting_active = NR_BSR_TRIGGER_NONE;
   }
   
   // ========== STEP 2: Add SDUs from RLC ==========
@@ -535,44 +501,29 @@ static int nr_ue_gf_build_mac_pdu(NR_UE_MAC_INST_t *mac,
     if (sdu_size <= 0) {
       continue;
     }
-
-    uint16_t sdu_length = nr_mac_rlc_data_req(mac->ue_id,
-                                            mac->ue_id,
-                                            false,
-                                            lcid,
-                                            bytes_requested,
-                                            (char *)mac_ce_p->cur_ptr + header_sz);
-
     
     // Request SDU from RLC
-    // Note: mac_rlc_data_req returns actual bytes copied
-    // To be checked!!
     tbs_size_t bytes_read = mac_rlc_data_req(mac->ue_id,
-                                              mac->ue_id,  // module_id
-                                              false,           // gNB_index
-                                              mac->frame,
-                                              ENB_FLAG_NO,
-                                              MBMS_FLAG_NO,
+                                              mac->ue_id,
+                                              false,             // gNB_index
                                               lcid,
                                               sdu_size,
-                                              &pdu[offset + subheader_size],
-                                              0,           // eNB_id (not used)
-                                              0);          // sourceL2Id (not used)
+                                              (char *)&pdu[offset + subheader_size]);
     
     if (bytes_read > 0) {
       // Write subheader
       if (bytes_read <= 255) {
         // Short length (F=0)
-        pdu[offset++] = (0 << 7) | (0 << 6) | (lcid & 0x3F);  // R=0, F=0, LCID
-        pdu[offset++] = bytes_read & 0xFF;                    // L (8 bits)
+        pdu[offset++] = (0 << 7) | (0 << 6) | (lcid & 0x3F);
+        pdu[offset++] = bytes_read & 0xFF;
       } else {
         // Long length (F=1)
-        pdu[offset++] = (0 << 7) | (1 << 6) | (lcid & 0x3F);  // R=0, F=1, LCID
-        pdu[offset++] = (bytes_read >> 8) & 0xFF;             // L (high byte)
-        pdu[offset++] = bytes_read & 0xFF;                    // L (low byte)
+        pdu[offset++] = (0 << 7) | (1 << 6) | (lcid & 0x3F);
+        pdu[offset++] = (bytes_read >> 8) & 0xFF;
+        pdu[offset++] = bytes_read & 0xFF;
       }
       
-      offset += bytes_read;  // Skip over SDU data
+      offset += bytes_read;
       
       // Update buffer tracking
       lc_sched_info->LCID_buffer_remain -= bytes_read;
@@ -587,15 +538,11 @@ static int nr_ue_gf_build_mac_pdu(NR_UE_MAC_INST_t *mac,
     int padding_len = pdu_size - offset;
     
     if (padding_len == 1) {
-      // Single byte padding: just LCID
       pdu[offset++] = UL_SCH_LCID_PADDING;
     } else if (padding_len == 2) {
-      // Two byte padding: LCID + LCID (two padding LCIDs)
       pdu[offset++] = UL_SCH_LCID_PADDING;
       pdu[offset++] = UL_SCH_LCID_PADDING;
     } else {
-      // Multi-byte padding: subheader + padding bytes
-      // Use padding LCID without length (fills rest of PDU)
       pdu[offset++] = UL_SCH_LCID_PADDING;
       memset(&pdu[offset], 0, padding_len - 1);
       offset = pdu_size;
@@ -606,7 +553,6 @@ static int nr_ue_gf_build_mac_pdu(NR_UE_MAC_INST_t *mac,
   
   return offset;
 }
-
 /**
  * @brief Check if current slot is a Grant-Free transmission occasion
  * 
@@ -923,12 +869,12 @@ void nr_ue_schedule_grant_free(NR_UE_MAC_INST_t *mac, frame_t frame, int slot)
     return;  // Not a GF occasion
   }
   
-  LOG_I(NR_MAC, "[UE %d] GF occasion detected at frame %d slot %d (config %d)\n",
+  LOG_I(NR_MAC, "[UE %d] GF occasion detected at frame %d slot %d (config %ld)\n",
         mac->ue_id, frame, slot, gf - mac->gf_config);
   
   // ========== STEP 2: Check for pending data ==========
   uint32_t pending_data = nr_ue_gf_check_pending_data(mac);
-  bool bsr_triggered = (mac->scheduling_info.BSR_reporting_active != BSR_NOT_TRIGGERED);
+  bool bsr_triggered = (mac->scheduling_info.BSR_reporting_active != NR_BSR_TRIGGER_NONE);
   
   LOG_D(NR_MAC, "[GF] Pending data: %d bytes, BSR triggered: %s\n",
         pending_data, bsr_triggered ? "yes" : "no");
@@ -1019,18 +965,18 @@ void nr_ue_schedule_grant_free(NR_UE_MAC_INST_t *mac, frame_t frame, int slot)
   NR_UE_UL_HARQ_INFO_t *harq = &mac->ul_harq_info[gf->harq_process_id];
   
   // If there's an existing buffer, check if it's a retransmission
-  if (harq->round == 0 || gf->ndi_toggle != harq->ndi) {
+  if (harq->round == 0 || gf->ndi_toggle != harq->last_ndi) {
     // New transmission
     if (harq->tx_buffer) {
       free(harq->tx_buffer);
     }
     harq->tx_buffer = mac_pdu;
     harq->tx_buffer_size = TBS;
-    harq->ndi = gf->ndi_toggle;
+    harq->last_ndi = gf->ndi_toggle;
     harq->round = 0;
     
     LOG_I(NR_MAC, "[GF] New transmission: HARQ pid=%d, NDI=%d, TBS=%d\n",
-          gf->harq_process_id, harq->ndi, TBS);
+          gf->harq_process_id, harq->last_ndi, TBS);
   } else {
     // Retransmission - use existing buffer
     free(mac_pdu);  // Don't need new PDU
